@@ -38,7 +38,9 @@ endif
 qtests_pci = \
   (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : []) +                  \
   (config_all_devices.has_key('CONFIG_IVSHMEM_DEVICE') ? ['ivshmem-test'] : []) +           \
-  (config_all_devices.has_key('CONFIG_IDT_NTB_IVSHMEM_DEVICE') ? ['idt-ntb-ivshmem-test'] : [])
+  (config_all_devices.has_key('CONFIG_IDT_NTB_IVSHMEM_DEVICE') ? ['idt-ntb-ivshmem-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_SWITCHTEC_NTB_IVSHMEM_DEVICE') ? \
+   ['switchtec-ntb-ivshmem-test'] : [])
 
 qtests_cxl = \
   (config_all_devices.has_key('CONFIG_CXL') ? ['cxl-test'] : [])
@@ -394,6 +396,7 @@ qtests = {
   'erst-test': files('erst-test.c'),
   'ivshmem-test': [rt, '../../contrib/ivshmem-server/ivshmem-server.c'],
   'idt-ntb-ivshmem-test': [rt, '../../contrib/ivshmem-server/ivshmem-server.c'],
+  'switchtec-ntb-ivshmem-test': [rt, '../../contrib/ivshmem-server/ivshmem-server.c'],
   'migration-test': test_migration_files + migration_tls_files + migration_colo_files,
   'pxe-test': files('boot-sector.c'),
   'pnv-xive2-test': files('pnv-xive2-common.c', 'pnv-xive2-flush-sync.c',

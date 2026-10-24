@@ -20,6 +20,17 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 
+/*
+ * CLKCTL1.PSCCTL0 controls the Flexcomm 0..7 clocks in bits 8..15 and
+ * the dedicated Flexcomm 14/15 clocks in bits 22/23.  Model the ten
+ * clocked Flexcomm blocks in SDK instance order (0..7, 14, 15); the
+ * output index is the logical index used by the SoC, not the hardware
+ * Flexcomm number.
+ */
+static const uint8_t rt6xx_flexcomm_ctl_bit[] = {
+    8, 9, 10, 11, 12, 13, 14, 15, 22, 23,
+};
+
 #define RT6XX_SYSCON_IOSIZE 0x1000
 #define RT6XX_NO_ALIAS 0xff
 
@@ -324,7 +335,8 @@ static void rt6xx_update_outputs(Rt6xxSysconState *s)
         uint32_t gates = rt6xx_reg_value(s, 0x010);
 
         for (unsigned i = 0; i < ARRAY_SIZE(s->flexcomm_clock); i++) {
-            qemu_set_irq(s->flexcomm_clock[i], extract32(gates, 8 + i, 1));
+            qemu_set_irq(s->flexcomm_clock[i],
+                         extract32(gates, rt6xx_flexcomm_ctl_bit[i], 1));
         }
         gates = rt6xx_reg_value(s, 0x014);
         for (unsigned i = 0; i < ARRAY_SIZE(s->gpio_clock); i++) {
@@ -462,7 +474,8 @@ static void rt6xx_syscon_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(dev, &s->ffro_enable_out, "ffro-enabled", 1);
     qdev_init_gpio_out_named(dev, s->flexcomm_clock,
-                             "flexcomm-clock", 8);
+                             "flexcomm-clock",
+                             ARRAY_SIZE(s->flexcomm_clock));
     qdev_init_gpio_out_named(dev, s->gpio_clock, "gpio-clock", 8);
     qdev_init_gpio_in_named(dev, rt6xx_ffro_enable, "ffro-enable-in", 1);
     s->cpuclk = qdev_init_clock_out(dev, "cpuclk");

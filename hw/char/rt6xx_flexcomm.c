@@ -38,19 +38,63 @@
 #define PSELID_ID           0x00101000
 /*
  * The shared FLEXCOMM SVD node masks the capability indicators to zero
- * (it models the I2S-only Flexcomm 11), but every Flexcomm 0..8 on the
- * RT685S physically contains a USART block, which this model exposes
- * once selected.  Bits 20 and 24 are the read-only FLEXCOMM_ID fields;
- * bit 8 advertises the present USART so that the SDK's
- * FLEXCOMM_PeripheralIsPresent() (PSELID[4 + 3]) succeeds.
+ * (it models the I2S-only Flexcomm 11), but the NXP feature header and
+ * the SDK instance tables establish the real contents: USART/SPI/I2C/
+ * I2S in Flexcomm 0..7, SPI only in Flexcomm 14 and I2C only in
+ * Flexcomm 15.  The read-only presence bits are derived from the
+ * instance "capabilities" property so that the SDK's
+ * FLEXCOMM_PeripheralIsPresent() (PSELID bit 3 + PERIPH, with I2S RX
+ * sharing bit 7) succeeds for every block an instance really contains.
+ * Bits 31..12 are the read-only FLEXCOMM_ID field.
  */
-#define PSELID_USART_PRESENT  BIT(4)
-#define PSELID_RESET          (PSELID_ID | PSELID_USART_PRESENT)
+
+static Rt6xxFlexcommPeriph rt6xx_flexcomm_selected(Rt6xxFlexcommState *s)
+{
+    return s->pselid & PSELID_PERSEL_MASK;
+}
 
 static bool rt6xx_flexcomm_usart_selected(Rt6xxFlexcommState *s)
 {
-    return (s->pselid & PSELID_PERSEL_MASK) == RT6XX_FLEXCOMM_PERIPH_USART;
+    return rt6xx_flexcomm_selected(s) == RT6XX_FLEXCOMM_PERIPH_USART;
 }
+
+static uint32_t rt6xx_flexcomm_caps_present(Rt6xxFlexcommState *s)
+{
+    uint32_t value = PSELID_ID;
+
+    if (s->capabilities & RT6XX_FLEXCOMM_CAP_USART) {
+        value |= BIT(4);
+    }
+    if (s->capabilities & RT6XX_FLEXCOMM_CAP_SPI) {
+        value |= BIT(5);
+    }
+    if (s->capabilities & RT6XX_FLEXCOMM_CAP_I2C) {
+        value |= BIT(6);
+    }
+    if (s->capabilities & RT6XX_FLEXCOMM_CAP_I2S) {
+        value |= BIT(7);
+    }
+    return value;
+}
+
+static bool rt6xx_flexcomm_have_periph(Rt6xxFlexcommState *s,
+                                       Rt6xxFlexcommPeriph periph)
+{
+    switch (periph) {
+    case RT6XX_FLEXCOMM_PERIPH_NONE:
+        return true;
+    case RT6XX_FLEXCOMM_PERIPH_USART:
+        return s->capabilities & RT6XX_FLEXCOMM_CAP_USART;
+    case RT6XX_FLEXCOMM_PERIPH_SPI:
+        return s->capabilities & RT6XX_FLEXCOMM_CAP_SPI;
+    case RT6XX_FLEXCOMM_PERIPH_I2C:
+        return s->capabilities & RT6XX_FLEXCOMM_CAP_I2C;
+    default:
+        return false;
+    }
+}
+
+
 
 static bool rt6xx_flexcomm_active(Rt6xxFlexcommState *s)
 {
@@ -140,7 +184,7 @@ static void rt6xx_flexcomm_reset_registers(Rt6xxFlexcommState *s)
     u->fifointenset = 0;
     u->rx_head = 0;
     u->rx_count = 0;
-    s->pselid = PSELID_RESET;
+    s->pselid = rt6xx_flexcomm_caps_present(s);
 }
 
 static void rt6xx_flexcomm_set_clock(void *opaque, int n, int level)
@@ -307,7 +351,15 @@ static void rt6xx_flexcomm_write(void *opaque, hwaddr offset,
         break;
     case 0xff8:
         if (!(s->pselid & PSELID_LOCK)) {
-            s->pselid = (s->pselid & ~0x0f) | (val & 0x0f);
+            Rt6xxFlexcommPeriph sel = val & PSELID_PERSEL_MASK;
+
+            if (!rt6xx_flexcomm_have_periph(s, sel)) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "%s: PSELID selects absent function %u\n",
+                              TYPE_RT6XX_FLEXCOMM, sel);
+                sel = rt6xx_flexcomm_selected(s);
+            }
+            s->pselid = (s->pselid & ~0x0f) | sel | (val & PSELID_LOCK);
         }
         break;
     case 0x024:
@@ -410,6 +462,8 @@ static void rt6xx_flexcomm_init(Object *obj)
 
 static const Property rt6xx_flexcomm_properties[] = {
     DEFINE_PROP_CHR("chardev", Rt6xxFlexcommState, chr),
+    DEFINE_PROP_UINT32("capabilities", Rt6xxFlexcommState, capabilities,
+                       RT6XX_FLEXCOMM_CAP_ALL),
 };
 
 static void rt6xx_flexcomm_class_init(ObjectClass *klass, const void *data)

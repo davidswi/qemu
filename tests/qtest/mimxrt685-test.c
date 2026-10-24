@@ -19,6 +19,12 @@
 #define SYSCTL1 0x40022000
 #define GPIO    0x40100000
 #define FC0     0x40106000
+#define FC14    0x40126000
+#define FC15    0x40127000
+
+#define FC_PSELID_PRESENT_ALL 0x001010f0
+#define FC_PSELID_PRESENT_SPI 0x00101020
+#define FC_PSELID_PRESENT_I2C 0x00101040
 
 static void enable_flexcomm0(QTestState *s)
 {
@@ -194,7 +200,7 @@ static void test_system_reset(void)
     g_assert_cmphex(qtest_readl(s, CLKCTL0 + 0x430), ==, 0);
     g_assert_cmphex(qtest_readl(s, SYSCTL0 + 0x00c), ==, 1);
     g_assert_cmphex(qtest_readl(s, IOPCTL + 0x164), ==, 0x41);
-    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101010);
+    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, FC_PSELID_PRESENT_ALL);
     qtest_quit(s);
 }
 
@@ -251,6 +257,63 @@ static void test_gpio_registers_and_irq(void)
     qtest_quit(s);
 }
 
+static void test_flexcomm_topology(void)
+{
+    static const uint32_t fc_base[] = {
+        0x40106000, 0x40107000, 0x40108000, 0x40109000,
+        0x40122000, 0x40123000, 0x40124000, 0x40125000,
+    };
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    /* Flexcomm 0..7 integrate USART, SPI, I2C and I2S. */
+    for (unsigned i = 0; i < ARRAY_SIZE(fc_base); i++) {
+        g_assert_cmphex(qtest_readl(s, fc_base[i] + 0xff8), ==,
+                        FC_PSELID_PRESENT_ALL);
+    }
+    /* Flexcomm 14 is SPI-only and Flexcomm 15 is I2C-only. */
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xff8), ==, FC_PSELID_PRESENT_SPI);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8), ==, FC_PSELID_PRESENT_I2C);
+
+    /* Selecting an absent function is rejected; 0 (none) is accepted. */
+    qtest_writel(s, FC14 + 0xff8, 1);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xff8) & 0xf, ==, 0);
+    qtest_writel(s, FC14 + 0xff8, 3);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xff8) & 0xf, ==, 0);
+    qtest_writel(s, FC14 + 0xff8, 2);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xff8) & 0xf, ==, 2);
+    qtest_writel(s, FC14 + 0xff8, 0);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xff8) & 0xf, ==, 0);
+
+    qtest_writel(s, FC15 + 0xff8, 1);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8) & 0xf, ==, 0);
+    qtest_writel(s, FC15 + 0xff8, 2);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8) & 0xf, ==, 0);
+    qtest_writel(s, FC15 + 0xff8, 3);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8) & 0xf, ==, 3);
+
+    /* LOCK freezes PERSEL until a peripheral reset. */
+    qtest_writel(s, FC15 + 0xff8, 3 | BIT(3));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8) & 0xf, ==, 3 | BIT(3));
+    qtest_writel(s, FC15 + 0xff8, 0);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8) & 0xf, ==, 3 | BIT(3));
+
+    /* CLKCTL1 bit 22/23 and RSTCTL1 bit 22/23 gate FC14/FC15. */
+    qtest_writel(s, CLKCTL1 + 0x040, BIT(22));
+    g_assert_cmphex(qtest_readl(s, CLKCTL1 + 0x010) & BIT(22), ==, BIT(22));
+    qtest_writel(s, CLKCTL1 + 0x070, BIT(22));
+    g_assert_cmphex(qtest_readl(s, CLKCTL1 + 0x010) & BIT(22), ==, 0);
+    qtest_writel(s, RSTCTL1 + 0x070, BIT(23));
+    g_assert_cmphex(qtest_readl(s, RSTCTL1 + 0x010) & BIT(23), ==, 0);
+    qtest_writel(s, RSTCTL1 + 0x040, BIT(23));
+    g_assert_cmphex(qtest_readl(s, RSTCTL1 + 0x010) & BIT(23), ==, BIT(23));
+
+    /* Peripheral reset clears LOCK and restores the capability bits. */
+    qtest_writel(s, RSTCTL1 + 0x040, BIT(23));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8), ==, FC_PSELID_PRESENT_I2C);
+    qtest_writel(s, RSTCTL1 + 0x070, BIT(23));
+    qtest_quit(s);
+}
+
 static void test_flexcomm_uart(void)
 {
     int sock_fd;
@@ -261,7 +324,7 @@ static void test_flexcomm_uart(void)
 
     qtest_irq_intercept_in(s, "/machine/soc/armv7m");
 
-    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101010);
+    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, FC_PSELID_PRESENT_ALL);
     enable_flexcomm0(s);
     qtest_writel(s, FC0 + 0xe00, BIT(0) | BIT(1));
     qtest_writel(s, FC0 + 0xe20, 'T');
@@ -285,7 +348,7 @@ static void test_flexcomm_uart(void)
     qtest_writel(s, FC0 + 0xff8, 2);
     g_assert_cmphex(qtest_readl(s, FC0 + 0xff8) & 0xf, ==, 9);
     qtest_writel(s, RSTCTL1 + 0x040, BIT(8));
-    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101010);
+    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, FC_PSELID_PRESENT_ALL);
     qtest_writel(s, RSTCTL1 + 0x070, BIT(8));
     qtest_writel(s, FC0 + 0xff8, 1);
     g_assert_cmphex(qtest_readl(s, FC0 + 0xe00), ==, 0);
@@ -311,6 +374,7 @@ int main(int argc, char **argv)
     qtest_add_func("/mimxrt685/reset-and-iopctl", test_reset_and_iopctl);
     qtest_add_func("/mimxrt685/gpio-registers-and-irq",
                    test_gpio_registers_and_irq);
+    qtest_add_func("/mimxrt685/flexcomm-topology", test_flexcomm_topology);
     qtest_add_func("/mimxrt685/flexcomm-uart", test_flexcomm_uart);
     return g_test_run();
 }

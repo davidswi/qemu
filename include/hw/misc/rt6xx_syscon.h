@@ -33,7 +33,7 @@ struct Rt6xxSysconState {
     uint32_t variant;
     bool ffro_enabled;
     qemu_irq ffro_enable_out;
-    qemu_irq flexcomm_clock[8];
+    qemu_irq flexcomm_clock[10];
     qemu_irq gpio_clock[8];
     Clock *cpuclk;
 };

@@ -17,6 +17,15 @@
 
 #define RT6XX_RSTCTL_IOSIZE 0x80
 
+/*
+ * RSTCTL1.PRSTCTL0 resets the Flexcomm 0..7 blocks in bits 8..15 and
+ * the dedicated Flexcomm 14/15 blocks in bits 22/23.  Output index is
+ * the logical SoC index (Flexcomm 0..7, 14, 15 in SDK instance order).
+ */
+static const uint8_t rt6xx_flexcomm_ctl_bit[] = {
+    8, 9, 10, 11, 12, 13, 14, 15, 22, 23,
+};
+
 static const uint32_t reset_values[2][3] = {
     [RT6XX_RSTCTL0] = { 0x01f11f02, 0x0101810c, 0x1c000001 },
     [RT6XX_RSTCTL1] = { 0x01c0ff00, 0xb18100ff, 0xc001011f },
@@ -34,7 +43,8 @@ static void rt6xx_rstctl_update_outputs(Rt6xxRstctlState *s)
     }
 
     for (unsigned i = 0; i < ARRAY_SIZE(s->flexcomm_reset); i++) {
-        qemu_set_irq(s->flexcomm_reset[i], extract32(s->prstctl[0], 8 + i, 1));
+        qemu_set_irq(s->flexcomm_reset[i],
+                     extract32(s->prstctl[0], rt6xx_flexcomm_ctl_bit[i], 1));
     }
     for (unsigned i = 0; i < ARRAY_SIZE(s->gpio_reset); i++) {
         qemu_set_irq(s->gpio_reset[i], extract32(s->prstctl[1], i, 1));
@@ -154,7 +164,8 @@ static void rt6xx_rstctl_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &rt6xx_rstctl_ops, s,
                           TYPE_RT6XX_RSTCTL, RT6XX_RSTCTL_IOSIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
-    qdev_init_gpio_out_named(dev, s->flexcomm_reset, "flexcomm-reset", 8);
+    qdev_init_gpio_out_named(dev, s->flexcomm_reset, "flexcomm-reset",
+                             ARRAY_SIZE(s->flexcomm_reset));
     qdev_init_gpio_out_named(dev, s->gpio_reset, "gpio-reset", 8);
 }
 

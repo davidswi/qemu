@@ -53,7 +53,7 @@ struct IMXRT685State {
     Rt6xxRstctlState rstctl[2];
     Rt6xxIopctlState iopctl;
     Rt6xxGpioState gpio;
-    Rt6xxFlexcommState flexcomm[8];
+    Rt6xxFlexcommState flexcomm[10];
     char *cpu_type;
 };
 

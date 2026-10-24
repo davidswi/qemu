@@ -16,12 +16,35 @@
 #include "hw/core/qdev-properties.h"
 #include "qemu/module.h"
 
-static const hwaddr flexcomm_base[8] = {
-    0x40106000, 0x40107000, 0x40108000, 0x40109000,
-    0x40122000, 0x40123000, 0x40124000, 0x40125000,
+/*
+ * The RT685S integrates ten Flexcomm blocks.  Entries are in SDK
+ * instance order; the array index is the logical index used for the
+ * CLKCTL1/RSTCTL1 control outputs (PSCCTL1/PRSTCTL1 bits 8..15,
+ * 22 and 23), while hwnum is the hardware Flexcomm number used for
+ * naming and USART chardev assignment.
+ */
+static const struct Rt6xxFlexcommDesc {
+    unsigned hwnum;
+    hwaddr base;
+    unsigned irq;
+    uint32_t caps;
+} flexcomm_desc[] = {
+    {  0, 0x40106000, 14, RT6XX_FLEXCOMM_CAP_ALL },
+    {  1, 0x40107000, 15, RT6XX_FLEXCOMM_CAP_ALL },
+    {  2, 0x40108000, 16, RT6XX_FLEXCOMM_CAP_ALL },
+    {  3, 0x40109000, 17, RT6XX_FLEXCOMM_CAP_ALL },
+    {  4, 0x40122000, 18, RT6XX_FLEXCOMM_CAP_ALL },
+    {  5, 0x40123000, 19, RT6XX_FLEXCOMM_CAP_ALL },
+    {  6, 0x40124000, 43, RT6XX_FLEXCOMM_CAP_ALL },
+    {  7, 0x40125000, 44, RT6XX_FLEXCOMM_CAP_ALL },
+    { 14, 0x40126000, 20, RT6XX_FLEXCOMM_CAP_SPI },
+    { 15, 0x40127000, 21, RT6XX_FLEXCOMM_CAP_I2C },
 };
 
-static const unsigned flexcomm_irq[8] = { 14, 15, 16, 17, 18, 19, 43, 44 };
+static_assert(ARRAY_SIZE(flexcomm_desc) ==
+              sizeof_field(IMXRT685State, flexcomm) /
+              sizeof_field(IMXRT685State, flexcomm[0]),
+              "Flexcomm descriptor table and SoC state must match");
 
 static void imxrt685_init(Object *obj)
 {
@@ -42,8 +65,9 @@ static void imxrt685_init(Object *obj)
                             TYPE_RT6XX_RSTCTL);
     object_initialize_child(obj, "iopctl", &s->iopctl, TYPE_RT6XX_IOPCTL);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_RT6XX_GPIO);
-    for (unsigned i = 0; i < ARRAY_SIZE(s->flexcomm); i++) {
-        g_autofree char *name = g_strdup_printf("flexcomm%u", i);
+    for (unsigned i = 0; i < ARRAY_SIZE(flexcomm_desc); i++) {
+        g_autofree char *name =
+            g_strdup_printf("flexcomm%u", flexcomm_desc[i].hwnum);
 
         object_initialize_child(obj, name, &s->flexcomm[i],
                                 TYPE_RT6XX_FLEXCOMM);
@@ -198,16 +222,22 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 1,
                        qdev_get_gpio_in(armv7m, 3));
 
-    for (unsigned i = 0; i < ARRAY_SIZE(s->flexcomm); i++) {
+    for (unsigned i = 0; i < ARRAY_SIZE(flexcomm_desc); i++) {
+        const struct Rt6xxFlexcommDesc *d = &flexcomm_desc[i];
         DeviceState *fc = DEVICE(&s->flexcomm[i]);
 
-        qdev_prop_set_chr(fc, "chardev", serial_hd(i));
+        /* Only Flexcomm 0..7 contain a USART; do not consume serial
+         * backends for the SPI-only and I2C-only instances. */
+        if (d->caps & RT6XX_FLEXCOMM_CAP_USART) {
+            qdev_prop_set_chr(fc, "chardev", serial_hd(d->hwnum));
+        }
+        qdev_prop_set_uint32(fc, "capabilities", d->caps);
         if (!sysbus_realize(SYS_BUS_DEVICE(fc), errp)) {
             return;
         }
-        sysbus_mmio_map(SYS_BUS_DEVICE(fc), 0, flexcomm_base[i]);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fc), 0, d->base);
         sysbus_connect_irq(SYS_BUS_DEVICE(fc), 0,
-                           qdev_get_gpio_in(armv7m, flexcomm_irq[i]));
+                           qdev_get_gpio_in(armv7m, d->irq));
         qdev_connect_gpio_out_named(DEVICE(&s->clkctl[1]),
                                     "flexcomm-clock", i,
                                     qdev_get_gpio_in_named(fc,
@@ -215,6 +245,9 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
         qdev_connect_gpio_out_named(DEVICE(&s->rstctl[1]),
                                     "flexcomm-reset", i,
                                     qdev_get_gpio_in_named(fc, "reset", 0));
+    }
+
+    for (unsigned i = 0; i < 8; i++) {
         qdev_connect_gpio_out_named(DEVICE(&s->clkctl[1]), "gpio-clock", i,
                                     qdev_get_gpio_in_named(DEVICE(&s->gpio),
                                         "clock-enabled", i));

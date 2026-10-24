@@ -220,6 +220,8 @@ static void test_gpio_registers_and_irq(void)
 {
     QTestState *s = qtest_init("-machine mimxrt685-evk");
 
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+
     /* Clock-gated/reset ports ignore writes. */
     qtest_writel(s, GPIO + 0x2000, BIT(4));
     g_assert_cmphex(qtest_readl(s, GPIO + 0x2000), ==, 0);
@@ -232,15 +234,16 @@ static void test_gpio_registers_and_irq(void)
     qtest_writeb(s, GPIO + 4, 0);
     g_assert_cmphex(qtest_readl(s, GPIO + 0x2100), ==, 0);
 
-    /* Rising edge on GPIO0_3 sets status A and external IRQ 2 pending. */
+    /* Rising edge on GPIO0_3 sets status A and asserts GPIO interrupt A. */
     qtest_writel(s, GPIO + 0x2500, BIT(3));
     qtest_writel(s, GPIO + 0x2600, BIT(3));
     qtest_writel(s, GPIO + 0x2680, BIT(3));
     qtest_set_irq_in(s, "/machine/soc/gpio", NULL, 3, 1);
     g_assert_cmphex(qtest_readl(s, GPIO + 0x2700), ==, BIT(3));
-    g_assert_cmphex(qtest_readl(s, 0xe000e200) & BIT(2), ==, BIT(2));
+    g_assert_true(qtest_get_irq(s, 2));
     qtest_writel(s, GPIO + 0x2700, BIT(3));
     g_assert_cmphex(qtest_readl(s, GPIO + 0x2700), ==, 0);
+    g_assert_false(qtest_get_irq(s, 2));
     qtest_writel(s, RSTCTL1 + 0x044, BIT(0));
     g_assert_cmphex(qtest_readl(s, GPIO + 0x2000), ==, 0);
     qtest_writel(s, RSTCTL1 + 0x074, BIT(0));
@@ -255,6 +258,8 @@ static void test_flexcomm_uart(void)
     char ch;
     QTestState *s = qtest_init_with_serial("-machine mimxrt685-evk",
                                            &sock_fd);
+
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
 
     g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101000);
     enable_flexcomm0(s);
@@ -272,8 +277,9 @@ static void test_flexcomm_uart(void)
     }
     g_assert_cmpint(tries, <, 1000);
     g_assert_cmphex(qtest_readl(s, FC0 + 0xe18) & BIT(3), ==, BIT(3));
-    g_assert_cmphex(qtest_readl(s, 0xe000e200) & BIT(14), ==, BIT(14));
+    g_assert_true(qtest_get_irq(s, 14));
     g_assert_cmphex(qtest_readl(s, FC0 + 0xe30), ==, 'R');
+    g_assert_false(qtest_get_irq(s, 14));
 
     qtest_writel(s, FC0 + 0xff8, 1 | BIT(3));
     qtest_writel(s, FC0 + 0xff8, 2);

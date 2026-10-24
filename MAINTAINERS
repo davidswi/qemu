@@ -920,6 +920,20 @@ F: hw/*/max78000*
 F: include/hw/*/max78000*
 F: tests/functional/arm/test_max78000fthr.py
 
+MIMXRT685-EVK local experimental model
+S: Orphan
+F: docs/system/arm/mimxrt685-evk.rst
+F: hw/arm/imxrt685.c
+F: hw/arm/mimxrt685_evk.c
+F: hw/char/rt6xx_flexcomm.c
+F: hw/gpio/rt6xx_*.c
+F: hw/misc/rt6xx_*.c
+F: include/hw/arm/imxrt685.h
+F: include/hw/char/rt6xx_flexcomm.h
+F: include/hw/gpio/rt6xx_*.h
+F: include/hw/misc/rt6xx_*.h
+F: tests/qtest/mimxrt685-test.c
+
 MCIMX6UL EVK / i.MX6ul
 M: Peter Maydell <peter.maydell@linaro.org>
 R: Jean-Christophe Dubois <jcd@tribudubois.net>

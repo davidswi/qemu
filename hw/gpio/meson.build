@@ -21,3 +21,7 @@ system_ss.add(when: 'CONFIG_SIFIVE_GPIO', if_true: files('sifive_gpio.c'))
 system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
 system_ss.add(when: 'CONFIG_CADENCE_GPIO', if_true: files('cadence_gpio.c'))
 system_ss.add(when: 'CONFIG_ALLWINNER_GPIO', if_true: files('allwinner-gpio.c'))
+system_ss.add(when: 'CONFIG_RT6XX_GPIO', if_true: files(
+  'rt6xx_gpio.c',
+  'rt6xx_iopctl.c',
+))

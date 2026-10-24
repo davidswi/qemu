@@ -64,6 +64,9 @@ config MAX78000_ICC
 config MAX78000_TRNG
     bool
 
+config RT6XX_SYSCON
+    bool
+
 config MOS6522
     bool
 
@@ -261,6 +264,9 @@ config AXIADO_CLK
     bool
 
 config K230_DECOMP_GZIP
+    bool
+
+config RT6XX_RSTCTL
     bool
 
 config SOPHGO_CV1800B_CLK

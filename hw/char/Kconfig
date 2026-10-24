@@ -99,3 +99,6 @@ config IP_OCTAL_232
 config DW8250
     bool
     select SERIAL_MM
+
+config RT6XX_FLEXCOMM
+    bool

@@ -11,6 +11,7 @@
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "hw/arm/imxrt685.h"
+#include "hw/core/loader.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "qemu/module.h"
@@ -75,6 +76,49 @@ static bool imxrt685_realize_rstctl(Rt6xxRstctlState *s, unsigned variant,
     return true;
 }
 
+/*
+ * The RT685S boot ROM is proprietary mask ROM.  The MCUXpresso SDK
+ * clock driver calls three of its documented OTP API entry points
+ * (see FSL_ROM_OTP_* in MIMXRT685S_cm33_COMMON.h):
+ *
+ *   void otp_init(uint32_t src_clk_freq)                  @ +0x9ff8
+ *   void otp_deinit(void)                                 @ +0xa046
+ *   void otp_fuse_read(uint32_t fuse_idx, uint32_t *out)  @ +0xa056
+ *
+ * Model them with ABI-compatible code returning "unprogrammed" (zero)
+ * OTP contents, which is the reset state of the OTP controller model.
+ * Every other ROM address executes BKPT #0 so that a call into an
+ * unmodeled ROM entry faults visibly instead of running zeroes.
+ */
+static void imxrt685_populate_rom(void)
+{
+    g_autofree uint16_t *image = g_new(uint16_t, IMXRT685_ROM_SIZE / 2);
+    static const struct {
+        hwaddr offset;
+        uint16_t code[3];
+        unsigned len;
+    } entries[] = {
+        { 0x9ff8, { GUINT16_TO_LE(0x4770) }, 1 },         /* bx lr */
+        { 0xa046, { GUINT16_TO_LE(0x4770) }, 1 },         /* bx lr */
+        { 0xa056, { GUINT16_TO_LE(0x2200),   /* movs r2, #0 */
+                    GUINT16_TO_LE(0x600A),   /* str r2, [r1] */
+                    GUINT16_TO_LE(0x4770) }, /* bx lr */
+          3 },
+    };
+
+    for (unsigned i = 0; i < IMXRT685_ROM_SIZE / 2; i++) {
+        image[i] = GUINT16_TO_LE(0xbe00); /* bkpt #0 */
+    }
+    for (unsigned e = 0; e < ARRAY_SIZE(entries); e++) {
+        for (unsigned j = 0; j < entries[e].len; j++) {
+            image[entries[e].offset / 2 + j] = entries[e].code[j];
+        }
+    }
+
+    rom_add_blob_fixed("imxrt685.rom", image, IMXRT685_ROM_SIZE,
+                       IMXRT685_ROM_BASE);
+}
+
 static void imxrt685_realize(DeviceState *dev, Error **errp)
 {
     IMXRT685State *s = IMXRT685_SOC(dev);
@@ -97,6 +141,17 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
                              IMXRT685_SRAM_SIZE);
     memory_region_add_subregion(system_memory, IMXRT685_SRAM_CODE_BASE,
                                 &s->sram_code_alias);
+
+    if (!memory_region_init_rom(&s->rom, OBJECT(s), "imxrt685.rom",
+                                IMXRT685_ROM_SIZE, errp)) {
+        return;
+    }
+    memory_region_add_subregion(system_memory, IMXRT685_ROM_BASE, &s->rom);
+    memory_region_init_alias(&s->rom_alias, OBJECT(s), "imxrt685.rom-alias",
+                             &s->rom, 0, IMXRT685_ROM_SIZE);
+    memory_region_add_subregion(system_memory, IMXRT685_ROM_ALIAS_BASE,
+                                &s->rom_alias);
+    imxrt685_populate_rom();
 
     if (!imxrt685_realize_syscon(&s->clkctl[0], RT6XX_CLKCTL0,
                                  IMXRT685_CLKCTL0_BASE, errp) ||

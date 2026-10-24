@@ -12,6 +12,42 @@
 #include "hw/arm/imxrt685.h"
 #include "hw/core/boards.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/loader.h"
+#include "qemu/error-report.h"
+#include "elf.h"
+
+/*
+ * The official MCUXpresso RAM linker configurations place the vector
+ * table at the base of the RAM alias window (0x00080000 on real
+ * silicon), not at address zero.  On hardware that image is started by
+ * a debug probe or boot loader which programs the reset vector fetch
+ * address; do the equivalent here by taking the initial vector base
+ * from the loaded ELF's lowest load address.
+ */
+static void mimxrt685_evk_set_vector_base(MachineState *machine,
+                                          ARMCPU *cpu)
+{
+    uint64_t low = 0, high = 0, entry = 0;
+
+    if (!machine->kernel_filename) {
+        return;
+    }
+
+    /*
+     * Only used to discover the ELF load range; the authoritative load
+     * and CPU reset wiring is done by armv7m_load_kernel().
+     */
+    if (load_elf(machine->kernel_filename, NULL, NULL, NULL, &entry,
+                 &low, &high, NULL, ELFDATA2LSB, EM_ARM, 1, 0) < 0) {
+        /* Not an ELF (raw binary): keep the SoC default vector base. */
+        return;
+    }
+
+    object_property_set_uint(OBJECT(cpu), "init-svtor", low, &error_abort);
+    object_property_set_uint(OBJECT(cpu), "init-nsvtor", low, &error_abort);
+    info_report("mimxrt685-evk: vector base set to 0x%" PRIx64 " (entry 0x%"
+                PRIx64 ")", low, entry);
+}
 
 #define TYPE_MIMXRT685_EVK_MACHINE MACHINE_TYPE_NAME("mimxrt685-evk")
 OBJECT_DECLARE_SIMPLE_TYPE(MIMXRT685EVKMachineState,
@@ -33,6 +69,7 @@ static void mimxrt685_evk_init(MachineState *machine)
 
     armv7m_load_kernel(s->soc.armv7m.cpu, machine->kernel_filename,
                        IMXRT685_SRAM_CODE_BASE, IMXRT685_SRAM_SIZE);
+    mimxrt685_evk_set_vector_base(machine, s->soc.armv7m.cpu);
 }
 
 static void mimxrt685_evk_machine_class_init(ObjectClass *oc,

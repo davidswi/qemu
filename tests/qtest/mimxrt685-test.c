@@ -194,7 +194,7 @@ static void test_system_reset(void)
     g_assert_cmphex(qtest_readl(s, CLKCTL0 + 0x430), ==, 0);
     g_assert_cmphex(qtest_readl(s, SYSCTL0 + 0x00c), ==, 1);
     g_assert_cmphex(qtest_readl(s, IOPCTL + 0x164), ==, 0x41);
-    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101000);
+    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101010);
     qtest_quit(s);
 }
 
@@ -261,7 +261,7 @@ static void test_flexcomm_uart(void)
 
     qtest_irq_intercept_in(s, "/machine/soc/armv7m");
 
-    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101000);
+    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101010);
     enable_flexcomm0(s);
     qtest_writel(s, FC0 + 0xe00, BIT(0) | BIT(1));
     qtest_writel(s, FC0 + 0xe20, 'T');
@@ -285,7 +285,7 @@ static void test_flexcomm_uart(void)
     qtest_writel(s, FC0 + 0xff8, 2);
     g_assert_cmphex(qtest_readl(s, FC0 + 0xff8) & 0xf, ==, 9);
     qtest_writel(s, RSTCTL1 + 0x040, BIT(8));
-    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101000);
+    g_assert_cmphex(qtest_readl(s, FC0 + 0xff8), ==, 0x00101010);
     qtest_writel(s, RSTCTL1 + 0x070, BIT(8));
     qtest_writel(s, FC0 + 0xff8, 1);
     g_assert_cmphex(qtest_readl(s, FC0 + 0xe00), ==, 0);

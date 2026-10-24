@@ -35,8 +35,17 @@
 #define FIFOINT_MASK        0x0f
 #define PSELID_PERSEL_MASK  0x07
 #define PSELID_LOCK         BIT(3)
+#define PSELID_USART_PRESENT BIT(4)
 #define PSELID_USART        1
-#define PSELID_RESET        0x00101000
+/*
+ * The shared FLEXCOMM SVD node masks the capability indicators to zero
+ * (it models the I2S-only Flexcomm 11), but every Flexcomm 0..8 on the
+ * RT685S physically contains a USART block, which this model exposes
+ * once selected.  Bits 20 and 24 are the read-only FLEXCOMM_ID fields;
+ * bit 8 advertises the present USART so that the SDK's
+ * FLEXCOMM_PeripheralIsPresent() (PSELID[4 + 3]) succeeds.
+ */
+#define PSELID_RESET        (0x00101000 | PSELID_USART_PRESENT)
 
 static bool rt6xx_flexcomm_usart_selected(Rt6xxFlexcommState *s)
 {

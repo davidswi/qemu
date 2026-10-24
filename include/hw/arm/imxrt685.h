@@ -27,6 +27,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMXRT685State, IMXRT685_SOC)
 #define IMXRT685_SRAM_DATA_BASE 0x20000000ULL
 #define IMXRT685_SRAM_SIZE      0x00480000ULL
 
+#define IMXRT685_ROM_BASE       0x03000000ULL
+#define IMXRT685_ROM_ALIAS_BASE 0x13000000ULL
+#define IMXRT685_ROM_SIZE       0x00020000ULL
+
 #define IMXRT685_CLKCTL0_BASE   0x40001000ULL
 #define IMXRT685_RSTCTL0_BASE   0x40000000ULL
 #define IMXRT685_IOPCTL_BASE    0x40004000ULL
@@ -42,6 +46,8 @@ struct IMXRT685State {
     ARMv7MState armv7m;
     MemoryRegion sram;
     MemoryRegion sram_code_alias;
+    MemoryRegion rom;
+    MemoryRegion rom_alias;
     Rt6xxSysconState clkctl[2];
     Rt6xxSysconState sysctl[2];
     Rt6xxRstctlState rstctl[2];

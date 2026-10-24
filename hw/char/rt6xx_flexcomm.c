@@ -1,9 +1,9 @@
 /*
- * NXP i.MX RT6xx Flexcomm USART
+ * NXP i.MX RT6xx Flexcomm
  *
  * Register layout and reset values are from the project-local
- * MIMXRT685S_cm33 CMSIS-SVD. Transmission is synchronous from QEMU's point
- * of view; the TX FIFO therefore remains empty/not-full.
+ * MIMXRT685S_cm33 CMSIS-SVD.  Transmission is synchronous from QEMU's
+ * point of view; the TX FIFO therefore remains empty/not-full.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -35,8 +35,7 @@
 #define FIFOINT_MASK        0x0f
 #define PSELID_PERSEL_MASK  0x07
 #define PSELID_LOCK         BIT(3)
-#define PSELID_USART_PRESENT BIT(4)
-#define PSELID_USART        1
+#define PSELID_ID           0x00101000
 /*
  * The shared FLEXCOMM SVD node masks the capability indicators to zero
  * (it models the I2S-only Flexcomm 11), but every Flexcomm 0..8 on the
@@ -45,42 +44,46 @@
  * bit 8 advertises the present USART so that the SDK's
  * FLEXCOMM_PeripheralIsPresent() (PSELID[4 + 3]) succeeds.
  */
-#define PSELID_RESET        (0x00101000 | PSELID_USART_PRESENT)
+#define PSELID_USART_PRESENT  BIT(4)
+#define PSELID_RESET          (PSELID_ID | PSELID_USART_PRESENT)
 
 static bool rt6xx_flexcomm_usart_selected(Rt6xxFlexcommState *s)
 {
-    return (s->pselid & PSELID_PERSEL_MASK) == PSELID_USART;
+    return (s->pselid & PSELID_PERSEL_MASK) == RT6XX_FLEXCOMM_PERIPH_USART;
 }
 
 static bool rt6xx_flexcomm_active(Rt6xxFlexcommState *s)
 {
     return s->clock_enabled && !s->reset_asserted &&
-           rt6xx_flexcomm_usart_selected(s) && (s->cfg & CFG_ENABLE);
+           rt6xx_flexcomm_usart_selected(s) &&
+           (s->usart.cfg & CFG_ENABLE);
 }
 
 static uint32_t rt6xx_flexcomm_fifostat(Rt6xxFlexcommState *s)
 {
+    Rt6xxFlexcommUsartState *u = &s->usart;
     uint32_t value = BIT(4) | BIT(5);
 
-    if (s->rx_count) {
+    if (u->rx_count) {
         value |= BIT(6);
     }
-    if (s->rx_count == RT6XX_FLEXCOMM_FIFO_SIZE) {
+    if (u->rx_count == RT6XX_FLEXCOMM_FIFO_SIZE) {
         value |= BIT(7);
     }
-    value |= (uint32_t)s->rx_count << 16;
+    value |= (uint32_t)u->rx_count << 16;
     return value;
 }
 
 static uint32_t rt6xx_flexcomm_fifointstat(Rt6xxFlexcommState *s)
 {
+    Rt6xxFlexcommUsartState *u = &s->usart;
     uint32_t status = 0;
-    unsigned rx_trigger = extract32(s->fifotrig, 16, 4);
+    unsigned rx_trigger = extract32(u->fifotrig, 16, 4);
 
-    if (s->fifotrig & BIT(0)) {
+    if (u->fifotrig & BIT(0)) {
         status |= FIFOINT_TXLVL;
     }
-    if ((s->fifotrig & BIT(1)) && s->rx_count > rx_trigger) {
+    if ((u->fifotrig & BIT(1)) && u->rx_count > rx_trigger) {
         status |= FIFOINT_RXLVL;
     }
     return status;
@@ -88,9 +91,14 @@ static uint32_t rt6xx_flexcomm_fifointstat(Rt6xxFlexcommState *s)
 
 static void rt6xx_flexcomm_update_irq(Rt6xxFlexcommState *s)
 {
-    uint32_t peripheral = s->stat & s->intenset & INTEN_MASK;
-    uint32_t fifo = rt6xx_flexcomm_fifointstat(s) & s->fifointenset;
+    Rt6xxFlexcommUsartState *u = &s->usart;
+    uint32_t peripheral = u->stat & u->intenset & INTEN_MASK;
+    uint32_t fifo = rt6xx_flexcomm_fifointstat(s) & u->fifointenset;
 
+    /*
+     * USART, I2C and SPI share one NVIC line per instance; only the
+     * currently selected function may drive it.
+     */
     qemu_set_irq(s->irq, rt6xx_flexcomm_active(s) && (peripheral || fifo));
 }
 
@@ -99,39 +107,40 @@ static int rt6xx_flexcomm_can_receive(void *opaque)
     Rt6xxFlexcommState *s = opaque;
 
     return rt6xx_flexcomm_active(s) &&
-           (s->fifocfg & FIFOCFG_ENABLERX) &&
-           s->rx_count < RT6XX_FLEXCOMM_FIFO_SIZE;
+           (s->usart.fifocfg & FIFOCFG_ENABLERX) &&
+           s->usart.rx_count < RT6XX_FLEXCOMM_FIFO_SIZE;
 }
 
 static void rt6xx_flexcomm_receive(void *opaque, const uint8_t *buf, int size)
 {
     Rt6xxFlexcommState *s = opaque;
+    Rt6xxFlexcommUsartState *u = &s->usart;
 
-    for (int i = 0; i < size &&
-         s->rx_count < RT6XX_FLEXCOMM_FIFO_SIZE; i++) {
-        unsigned tail = (s->rx_head + s->rx_count) %
-                        RT6XX_FLEXCOMM_FIFO_SIZE;
-        s->rx_fifo[tail] = buf[i];
-        s->rx_count++;
+    for (int i = 0; i < size && u->rx_count < RT6XX_FLEXCOMM_FIFO_SIZE; i++) {
+        unsigned tail = (u->rx_head + u->rx_count) % RT6XX_FLEXCOMM_FIFO_SIZE;
+        u->rx_fifo[tail] = buf[i];
+        u->rx_count++;
     }
     rt6xx_flexcomm_update_irq(s);
 }
 
 static void rt6xx_flexcomm_reset_registers(Rt6xxFlexcommState *s)
 {
-    s->cfg = 0;
-    s->ctl = 0;
-    s->stat = STAT_RESET;
-    s->intenset = 0;
-    s->brg = 0;
-    s->osr = 0xf;
-    s->addr = 0;
-    s->fifocfg = 0;
-    s->fifotrig = 0;
-    s->fifointenset = 0;
+    Rt6xxFlexcommUsartState *u = &s->usart;
+
+    u->cfg = 0;
+    u->ctl = 0;
+    u->stat = STAT_RESET;
+    u->intenset = 0;
+    u->brg = 0;
+    u->osr = 0xf;
+    u->addr = 0;
+    u->fifocfg = 0;
+    u->fifotrig = 0;
+    u->fifointenset = 0;
+    u->rx_head = 0;
+    u->rx_count = 0;
     s->pselid = PSELID_RESET;
-    s->rx_head = 0;
-    s->rx_count = 0;
 }
 
 static void rt6xx_flexcomm_set_clock(void *opaque, int n, int level)
@@ -169,6 +178,7 @@ static bool rt6xx_flexcomm_check_access(Rt6xxFlexcommState *s, hwaddr offset)
 static uint64_t rt6xx_flexcomm_read(void *opaque, hwaddr offset, unsigned size)
 {
     Rt6xxFlexcommState *s = RT6XX_FLEXCOMM(opaque);
+    Rt6xxFlexcommUsartState *u = &s->usart;
     uint16_t value;
 
     if (!rt6xx_flexcomm_check_access(s, offset)) {
@@ -177,44 +187,44 @@ static uint64_t rt6xx_flexcomm_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case 0x000:
-        return s->cfg;
+        return u->cfg;
     case 0x004:
-        return s->ctl;
+        return u->ctl;
     case 0x008:
-        return s->stat;
+        return u->stat;
     case 0x00c:
-        return s->intenset;
+        return u->intenset;
     case 0x010:
         return 0;
     case 0x020:
-        return s->brg;
+        return u->brg;
     case 0x024:
-        return s->stat & s->intenset;
+        return u->stat & u->intenset;
     case 0x028:
-        return s->osr;
+        return u->osr;
     case 0x02c:
-        return s->addr;
+        return u->addr;
     case 0xe00:
-        return s->fifocfg;
+        return u->fifocfg;
     case 0xe04:
         return rt6xx_flexcomm_fifostat(s);
     case 0xe08:
-        return s->fifotrig;
+        return u->fifotrig;
     case 0xe10:
-        return s->fifointenset;
+        return u->fifointenset;
     case 0xe14:
         return 0;
     case 0xe18:
         return rt6xx_flexcomm_fifointstat(s);
     case 0xe30:
     case 0xe40:
-        if (!s->rx_count) {
+        if (!u->rx_count) {
             return 0;
         }
-        value = s->rx_fifo[s->rx_head];
+        value = u->rx_fifo[u->rx_head];
         if (offset == 0xe30) {
-            s->rx_head = (s->rx_head + 1) % RT6XX_FLEXCOMM_FIFO_SIZE;
-            s->rx_count--;
+            u->rx_head = (u->rx_head + 1) % RT6XX_FLEXCOMM_FIFO_SIZE;
+            u->rx_count--;
             qemu_chr_fe_accept_input(&s->chr);
             rt6xx_flexcomm_update_irq(s);
         }
@@ -236,6 +246,7 @@ static void rt6xx_flexcomm_write(void *opaque, hwaddr offset,
                                  uint64_t value, unsigned size)
 {
     Rt6xxFlexcommState *s = RT6XX_FLEXCOMM(opaque);
+    Rt6xxFlexcommUsartState *u = &s->usart;
     uint32_t val = value;
     uint8_t ch;
 
@@ -245,52 +256,51 @@ static void rt6xx_flexcomm_write(void *opaque, hwaddr offset,
 
     switch (offset) {
     case 0x000:
-        s->cfg = val & CFG_MASK;
+        u->cfg = val & CFG_MASK;
         break;
     case 0x004:
-        s->ctl = val & 0x00010346;
+        u->ctl = val & 0x00010346;
         break;
     case 0x008:
-        s->stat &= ~(val & STAT_MASK & ~STAT_RESET);
+        u->stat &= ~(val & STAT_MASK & ~STAT_RESET);
         break;
     case 0x00c:
-        s->intenset |= val & INTEN_MASK;
+        u->intenset |= val & INTEN_MASK;
         break;
     case 0x010:
-        s->intenset &= ~(val & INTEN_MASK);
+        u->intenset &= ~(val & INTEN_MASK);
         break;
     case 0x020:
-        s->brg = val & 0xffff;
+        u->brg = val & 0xffff;
         break;
     case 0x028:
-        s->osr = val & 0xf;
+        u->osr = val & 0xf;
         break;
     case 0x02c:
-        s->addr = val & 0xff;
+        u->addr = val & 0xff;
         break;
     case 0xe00:
-        s->fifocfg = val & (FIFOCFG_MASK &
+        u->fifocfg = val & (FIFOCFG_MASK &
                             ~(FIFOCFG_EMPTYTX | FIFOCFG_EMPTYRX));
         if (val & FIFOCFG_EMPTYRX) {
-            s->rx_head = 0;
-            s->rx_count = 0;
+            u->rx_head = 0;
+            u->rx_count = 0;
         }
         break;
     case 0xe04:
         /* TXERR and RXERR are write-one-to-clear; neither is sticky here. */
         break;
     case 0xe08:
-        s->fifotrig = val & 0x000f0f03;
+        u->fifotrig = val & 0x000f0f03;
         break;
     case 0xe10:
-        s->fifointenset |= val & FIFOINT_MASK;
+        u->fifointenset |= val & FIFOINT_MASK;
         break;
     case 0xe14:
-        s->fifointenset &= ~(val & FIFOINT_MASK);
+        u->fifointenset &= ~(val & FIFOINT_MASK);
         break;
     case 0xe20:
-        if (rt6xx_flexcomm_active(s) &&
-            (s->fifocfg & FIFOCFG_ENABLETX)) {
+        if (rt6xx_flexcomm_active(s) && (u->fifocfg & FIFOCFG_ENABLETX)) {
             ch = val;
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
         }
@@ -353,21 +363,21 @@ static const VMStateDescription vmstate_rt6xx_flexcomm = {
     .minimum_version_id = 1,
     .post_load = rt6xx_flexcomm_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32(cfg, Rt6xxFlexcommState),
-        VMSTATE_UINT32(ctl, Rt6xxFlexcommState),
-        VMSTATE_UINT32(stat, Rt6xxFlexcommState),
-        VMSTATE_UINT32(intenset, Rt6xxFlexcommState),
-        VMSTATE_UINT32(brg, Rt6xxFlexcommState),
-        VMSTATE_UINT32(osr, Rt6xxFlexcommState),
-        VMSTATE_UINT32(addr, Rt6xxFlexcommState),
-        VMSTATE_UINT32(fifocfg, Rt6xxFlexcommState),
-        VMSTATE_UINT32(fifotrig, Rt6xxFlexcommState),
-        VMSTATE_UINT32(fifointenset, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.cfg, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.ctl, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.stat, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.intenset, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.brg, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.osr, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.addr, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.fifocfg, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.fifotrig, Rt6xxFlexcommState),
+        VMSTATE_UINT32(usart.fifointenset, Rt6xxFlexcommState),
         VMSTATE_UINT32(pselid, Rt6xxFlexcommState),
-        VMSTATE_UINT16_ARRAY(rx_fifo, Rt6xxFlexcommState,
+        VMSTATE_UINT16_ARRAY(usart.rx_fifo, Rt6xxFlexcommState,
                              RT6XX_FLEXCOMM_FIFO_SIZE),
-        VMSTATE_UINT8(rx_head, Rt6xxFlexcommState),
-        VMSTATE_UINT8(rx_count, Rt6xxFlexcommState),
+        VMSTATE_UINT8(usart.rx_head, Rt6xxFlexcommState),
+        VMSTATE_UINT8(usart.rx_count, Rt6xxFlexcommState),
         VMSTATE_BOOL(clock_enabled, Rt6xxFlexcommState),
         VMSTATE_BOOL(reset_asserted, Rt6xxFlexcommState),
         VMSTATE_END_OF_LIST()

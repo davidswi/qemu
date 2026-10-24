@@ -102,3 +102,5 @@ config DW8250
 
 config RT6XX_FLEXCOMM
     bool
+    select I2C
+    select SSI

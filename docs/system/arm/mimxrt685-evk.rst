@@ -8,10 +8,13 @@ MIMXRT685S.  It is not intended for submission to upstream QEMU.
 
 The model uses QEMU's Armv7M container with a Cortex-M33, 60 external IRQ
 inputs and three implemented priority bits.  The CPU retains the Armv8-M
-Security Extension and therefore starts in Secure state.  The SAU is disabled
-at reset, as required by the architecture.  The model does not yet implement
-the RT685 IDAU, secure bus attribution, or the boot-ROM secure-to-non-secure
-handoff.  Both ``init-svtor`` and ``init-nsvtor`` are zero.
+Security Extension and therefore starts in Secure state.  The validated
+FreeRTOS configuration runs entirely in that state; TrustZone task support is
+disabled in FreeRTOS, but the CPU Security Extension remains present.  The SAU
+is disabled at reset, as required by the architecture.  The model does not yet
+implement the RT685 IDAU, secure bus attribution, or the boot-ROM
+secure-to-non-secure handoff.  The SoC defaults both vector bases to zero; for
+an ELF image the board resets them to the image's lowest load address.
 The Armv7M Secure and Non-secure address spaces use the same machine-memory
 container; no RT685-specific IDAU or downstream security checker is modeled.
 
@@ -37,6 +40,11 @@ models these as one backing store with its two Cortex-M33 views:
      - Alias of the same SRAM allocation, not duplicate RAM
      - Read/write/execute
      - Contents retained on system reset; alias
+   * - System ROM (``0x03000000`` and alias ``0x13000000``, ``0x00020000``)
+     - Read-only placeholder containing documented OTP API stubs required by
+       SDK clock initialization; all other halfwords are ``BKPT #0``
+     - Read/execute
+     - Immutable placeholder and alias
    * - CLKCTL0 (``0x40001000``, ``0x00001000``)
      - CLKCTL0 register device in the common memory container
      - 32-bit register-dependent read/write access
@@ -150,10 +158,29 @@ Use ``-kernel firmware.elf`` for an ELF linked into either SRAM view.  Raw
 images are loaded at address zero.  The first word must be the initial stack
 pointer and the second word the Thumb reset-handler address.
 
+The M2 firmware uses FreeRTOS's supported Secure-only configuration:
+``configENABLE_TRUSTZONE=0`` and ``configRUN_FREERTOS_SECURE_ONLY=1``.  This
+selects Secure exception returns while retaining the Cortex-M33 Security
+Extension.  A Non-secure firmware image would additionally require a modeled
+Secure boot handoff and memory attribution, which are outside this model.
+
+The canonical launch command is::
+
+  qemu-system-arm -M mimxrt685-evk \
+      -kernel firmware/build/freertos_hello.elf \
+      -nographic -monitor none
+
+The locally gated functional test is enabled by setting
+``MIMXRT685_FREERTOS_ELF`` to the built ELF.  It requires two ``Hello world.``
+task iterations, resets the machine through QMP, requires two more iterations,
+and checks the interrupt log for SVC, PendSV, periodic SysTick, valid Secure
+exception returns, and the absence of faults, lockups, unimplemented MMIO, or
+guest-error messages.
+
 Not modeled
 -----------
 
-The boot ROM, HiFi4 core and its TCM, external flash/PSRAM, non-USART Flexcomm
-functions, timers other than architectural SysTick, DMA, cache controller,
-ANACTRL/PMC power and analog behavior, and all board-level devices remain
-unmodeled.
+The full boot ROM, HiFi4 core and its TCM, external flash/PSRAM, non-USART
+Flexcomm functions, timers other than architectural SysTick, DMA, cache
+controller, ANACTRL/PMC power and analog behavior, Secure-to-Non-secure boot
+flow, and all board-level devices remain unmodeled.

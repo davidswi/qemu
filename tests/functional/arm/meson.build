@@ -60,6 +60,7 @@ tests_arm_system_thorough = [
   'integratorcp',
   'max78000fthr',
   'microbit',
+  'mimxrt685',
   'orangepi',
   'quanta_gsj',
   'raspi2',

@@ -65,6 +65,28 @@ typedef struct Rt6xxFlexcommI2cState {
     bool bus_active;        /* this master owns an open QEMU transfer */
 } Rt6xxFlexcommI2cState;
 
+/*
+ * SPI master state.  Frames complete synchronously, so there is no TX
+ * FIFO state: a written frame is either consumed immediately or dropped
+ * with a sticky FIFOSTAT.TXERR.  The RX FIFO stores complete FIFORD
+ * words so that received data and its SSEL/SOT metadata travel together.
+ */
+typedef struct Rt6xxFlexcommSpiState {
+    uint32_t cfg;
+    uint32_t dly;
+    uint32_t stat;          /* sticky SSA/SSD flags only */
+    uint32_t inten;
+    uint32_t div;
+    uint32_t fifocfg;
+    uint32_t fifoerr;       /* sticky TXERR/RXERR flags */
+    uint32_t fifotrig;
+    uint32_t fifointenset;
+    uint32_t rx_fifo[RT6XX_FLEXCOMM_FIFO_SIZE];
+    uint8_t rx_head;
+    uint8_t rx_count;
+    uint8_t ssel;           /* mask of currently asserted SSELs */
+} Rt6xxFlexcommSpiState;
+
 typedef struct Rt6xxFlexcommUsartState {
     uint32_t cfg;
     uint32_t ctl;
@@ -97,6 +119,7 @@ struct Rt6xxFlexcommState {
 
     Rt6xxFlexcommUsartState usart;
     Rt6xxFlexcommI2cState i2c;
+    Rt6xxFlexcommSpiState spi;
 };
 
 #endif

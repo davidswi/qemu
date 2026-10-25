@@ -54,6 +54,31 @@
  * their INTENSET plumbing is correct for later work.
  */
 #define I2C_IRQ_STAT_MASK       (BIT(0) | BIT(4) | BIT(6) | BIT(24) | BIT(25))
+
+/* SPI block (register offsets are absolute in the Flexcomm aperture) */
+#define SPI_CFG_ENABLE          BIT(0)
+#define SPI_CFG_MASTER          BIT(2)
+#define SPI_CFG_LOOP            BIT(7)
+#define SPI_CFG_SPOL(n)         BIT(8 + (n))
+#define SPI_CFG_MASK            0x0fbd
+#define SPI_STAT_SSA            BIT(4)
+#define SPI_STAT_SSD            BIT(5)
+#define SPI_STAT_ENDTRANSFER    BIT(7)
+#define SPI_STAT_MSTIDLE        BIT(8)
+#define SPI_STAT_W1C_MASK       (SPI_STAT_SSA | SPI_STAT_SSD)
+#define SPI_INTEN_MASK          0x130
+#define SPI_FIFOWR_EOT          BIT(20)
+#define SPI_FIFOWR_EOF          BIT(21)
+#define SPI_FIFOWR_RXIGNORE     BIT(22)
+#define SPI_FIFOWR_TXIGNORE     BIT(23)
+#define SPI_FIFOWR_LEN(v)       extract32((v), 24, 4)
+#define SPI_FIFORD_SOT          BIT(20)
+#define SPI_FIFOSTAT_TXERR      BIT(0)
+#define SPI_FIFOSTAT_RXERR      BIT(1)
+#define SPI_FIFOSTAT_PERINT     BIT(3)
+#define SPI_FIFOINT_PERINT      BIT(4)
+#define SPI_FIFOCFG_SIZE        (2U << 4) /* 16 entries */
+#define SPI_SSEL_COUNT          4
 /*
  * The shared FLEXCOMM SVD node masks the capability indicators to zero
  * (it models the I2S-only Flexcomm 11), but the NXP feature header and
@@ -343,6 +368,316 @@ static void rt6xx_flexcomm_i2c_write(Rt6xxFlexcommState *s, hwaddr offset,
     }
 }
 
+/*
+ * SPI master model.  One FIFOWR write completes one frame synchronously,
+ * so the TX FIFO is always empty and only received frames need queuing.
+ * DIV and DLY are stored but do not advance virtual time.
+ */
+static uint32_t rt6xx_flexcomm_spi_stat(Rt6xxFlexcommState *s)
+{
+    return (s->spi.stat & SPI_STAT_W1C_MASK) | SPI_STAT_MSTIDLE;
+}
+
+static uint32_t rt6xx_flexcomm_spi_peripheral_irq(Rt6xxFlexcommState *s)
+{
+    return rt6xx_flexcomm_spi_stat(s) & s->spi.inten & SPI_INTEN_MASK;
+}
+
+static int rt6xx_flexcomm_spi_cs_level(Rt6xxFlexcommState *s,
+                                       unsigned cs, bool active)
+{
+    bool active_high = s->spi.cfg & SPI_CFG_SPOL(cs);
+
+    return active ? active_high : !active_high;
+}
+
+static void rt6xx_flexcomm_spi_update_cs(Rt6xxFlexcommState *s)
+{
+    if (!s->spi_bus) {
+        return;
+    }
+
+    for (unsigned cs = 0; cs < SPI_SSEL_COUNT; cs++) {
+        DeviceState *dev = ssi_get_cs(s->spi_bus, cs);
+
+        if (!dev || !object_property_find(OBJECT(dev), SSI_GPIO_CS "[0]")) {
+            continue;
+        }
+        qemu_set_irq(qdev_get_gpio_in_named(dev, SSI_GPIO_CS, 0),
+                     rt6xx_flexcomm_spi_cs_level(s, cs,
+                                                 s->spi.ssel & BIT(cs)));
+    }
+}
+
+static void rt6xx_flexcomm_spi_set_ssel(Rt6xxFlexcommState *s, uint8_t ssel)
+{
+    Rt6xxFlexcommSpiState *sp = &s->spi;
+    uint8_t old = sp->ssel;
+
+    ssel &= MAKE_64BIT_MASK(0, SPI_SSEL_COUNT);
+    if (ssel & ~old) {
+        sp->stat |= SPI_STAT_SSA;
+    }
+    if (old & ~ssel) {
+        sp->stat |= SPI_STAT_SSD;
+    }
+    sp->ssel = ssel;
+    rt6xx_flexcomm_spi_update_cs(s);
+    if (old != ssel) {
+        trace_rt6xx_flexcomm_spi_cs(DEVICE(s)->canonical_path, old, ssel);
+    }
+}
+
+static uint32_t rt6xx_flexcomm_spi_fifostat(Rt6xxFlexcommState *s)
+{
+    Rt6xxFlexcommSpiState *sp = &s->spi;
+    uint32_t value = sp->fifoerr | BIT(4) | BIT(5);
+
+    if (rt6xx_flexcomm_spi_peripheral_irq(s)) {
+        value |= SPI_FIFOSTAT_PERINT;
+    }
+    if (sp->rx_count) {
+        value |= BIT(6);
+    }
+    if (sp->rx_count == RT6XX_FLEXCOMM_FIFO_SIZE) {
+        value |= BIT(7);
+    }
+    value |= (uint32_t)sp->rx_count << 16;
+    return value;
+}
+
+static uint32_t rt6xx_flexcomm_spi_fifointstat(Rt6xxFlexcommState *s)
+{
+    Rt6xxFlexcommSpiState *sp = &s->spi;
+    uint32_t status = sp->fifoerr;
+    unsigned rx_trigger = extract32(sp->fifotrig, 16, 4);
+
+    if (sp->fifotrig & BIT(0)) {
+        status |= FIFOINT_TXLVL;
+    }
+    if ((sp->fifotrig & BIT(1)) && sp->rx_count > rx_trigger) {
+        status |= FIFOINT_RXLVL;
+    }
+    if (rt6xx_flexcomm_spi_peripheral_irq(s)) {
+        status |= SPI_FIFOINT_PERINT;
+    }
+    return status;
+}
+
+static void rt6xx_flexcomm_spi_frame(Rt6xxFlexcommState *s, uint32_t val)
+{
+    Rt6xxFlexcommSpiState *sp = &s->spi;
+    unsigned bits = SPI_FIFOWR_LEN(val) + 1;
+    uint32_t data_mask = MAKE_64BIT_MASK(0, bits);
+    uint32_t tx = val & data_mask;
+    uint8_t ssel = ~extract32(val, 16, 4) & 0xf;
+    bool sot = (ssel & ~sp->ssel) != 0;
+    uint32_t rx;
+
+    if (!s->clock_enabled || s->reset_asserted) {
+        return;
+    }
+    if (!(sp->cfg & SPI_CFG_ENABLE) || !(sp->cfg & SPI_CFG_MASTER) ||
+        !(sp->fifocfg & FIFOCFG_ENABLETX)) {
+        sp->fifoerr |= SPI_FIFOSTAT_TXERR;
+        if (!(sp->cfg & SPI_CFG_MASTER)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: frame written while SPI master is disabled\n",
+                          TYPE_RT6XX_FLEXCOMM);
+        }
+        return;
+    }
+
+    if (val & SPI_FIFOWR_TXIGNORE) {
+        qemu_log_mask(LOG_UNIMP, "%s: SPI TXIGNORE drives zero data\n",
+                      TYPE_RT6XX_FLEXCOMM);
+        tx = 0;
+    }
+
+    rt6xx_flexcomm_spi_set_ssel(s, ssel);
+    rx = (sp->cfg & SPI_CFG_LOOP) ? tx : ssi_transfer(s->spi_bus, tx);
+    rx &= data_mask;
+
+    trace_rt6xx_flexcomm_spi_frame(DEVICE(s)->canonical_path, tx, rx, bits,
+                                   ssel, !!(val & SPI_FIFOWR_EOT),
+                                   !!(val & SPI_FIFOWR_EOF),
+                                   !!(sp->cfg & SPI_CFG_LOOP));
+
+    if (!(val & SPI_FIFOWR_RXIGNORE) &&
+        (sp->fifocfg & FIFOCFG_ENABLERX)) {
+        uint32_t entry = rx | ((uint32_t)(~ssel & 0xf) << 16);
+
+        if (sot) {
+            entry |= SPI_FIFORD_SOT;
+        }
+        if (sp->rx_count == RT6XX_FLEXCOMM_FIFO_SIZE) {
+            sp->fifoerr |= SPI_FIFOSTAT_RXERR;
+        } else {
+            unsigned tail = (sp->rx_head + sp->rx_count) %
+                            RT6XX_FLEXCOMM_FIFO_SIZE;
+
+            sp->rx_fifo[tail] = entry;
+            sp->rx_count++;
+        }
+    }
+
+    if (val & SPI_FIFOWR_EOT) {
+        rt6xx_flexcomm_spi_set_ssel(s, 0);
+    }
+}
+
+static uint64_t rt6xx_flexcomm_spi_read(Rt6xxFlexcommState *s, hwaddr offset)
+{
+    Rt6xxFlexcommSpiState *sp = &s->spi;
+    uint32_t value;
+
+    switch (offset) {
+    case 0x400:
+        return sp->cfg;
+    case 0x404:
+        return sp->dly;
+    case 0x408:
+        return rt6xx_flexcomm_spi_stat(s);
+    case 0x40c:
+    case 0x410:
+        return sp->inten;
+    case 0x424:
+        return sp->div;
+    case 0x428:
+        return rt6xx_flexcomm_spi_peripheral_irq(s);
+    case 0xe00:
+        return sp->fifocfg | SPI_FIFOCFG_SIZE;
+    case 0xe04:
+        return rt6xx_flexcomm_spi_fifostat(s);
+    case 0xe08:
+        return sp->fifotrig;
+    case 0xe10:
+    case 0xe14:
+        return sp->fifointenset;
+    case 0xe18:
+        return rt6xx_flexcomm_spi_fifointstat(s);
+    case 0xe20:
+        return 0;
+    case 0xe30:
+    case 0xe40:
+        if (!sp->rx_count) {
+            sp->fifoerr |= SPI_FIFOSTAT_RXERR;
+            return 0;
+        }
+        value = sp->rx_fifo[sp->rx_head];
+        if (offset == 0xe30) {
+            sp->rx_head = (sp->rx_head + 1) % RT6XX_FLEXCOMM_FIFO_SIZE;
+            sp->rx_count--;
+        }
+        return value;
+    case 0xe48:
+        return RT6XX_FLEXCOMM_FIFO_SIZE;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented SPI read at 0x%03"
+                      HWADDR_PRIx "\n", TYPE_RT6XX_FLEXCOMM, offset);
+        return 0;
+    }
+}
+
+static void rt6xx_flexcomm_spi_write(Rt6xxFlexcommState *s, hwaddr offset,
+                                     uint32_t val)
+{
+    Rt6xxFlexcommSpiState *sp = &s->spi;
+
+    switch (offset) {
+    case 0x400: {
+        uint32_t cfg = val & SPI_CFG_MASK;
+
+        if ((cfg & SPI_CFG_ENABLE) && !(cfg & SPI_CFG_MASTER)) {
+            qemu_log_mask(LOG_UNIMP, "%s: SPI slave mode is not implemented\n",
+                          TYPE_RT6XX_FLEXCOMM);
+        }
+        if (!(cfg & SPI_CFG_ENABLE) || !(cfg & SPI_CFG_MASTER)) {
+            rt6xx_flexcomm_spi_set_ssel(s, 0);
+        }
+        sp->cfg = cfg;
+        rt6xx_flexcomm_spi_update_cs(s);
+        break;
+    }
+    case 0x404:
+        sp->dly = val & 0xffff;
+        break;
+    case 0x408:
+        sp->stat &= ~(val & SPI_STAT_W1C_MASK);
+        if (val & SPI_STAT_ENDTRANSFER) {
+            rt6xx_flexcomm_spi_set_ssel(s, 0);
+        }
+        break;
+    case 0x40c:
+        sp->inten |= val & SPI_INTEN_MASK;
+        break;
+    case 0x410:
+        sp->inten &= ~(val & SPI_INTEN_MASK);
+        break;
+    case 0x424:
+        sp->div = val & 0xffff;
+        break;
+    case 0xe00:
+        if (val & (BIT(12) | BIT(13))) {
+            qemu_log_mask(LOG_UNIMP, "%s: SPI DMA is not implemented\n",
+                          TYPE_RT6XX_FLEXCOMM);
+        }
+        sp->fifocfg = val & (FIFOCFG_MASK &
+                             ~(FIFOCFG_EMPTYTX | FIFOCFG_EMPTYRX | 0x30));
+        if (val & FIFOCFG_EMPTYRX) {
+            sp->rx_head = 0;
+            sp->rx_count = 0;
+        }
+        break;
+    case 0xe04:
+        sp->fifoerr &= ~(val & (SPI_FIFOSTAT_TXERR | SPI_FIFOSTAT_RXERR));
+        break;
+    case 0xe08:
+        sp->fifotrig = val & 0x000f0f03;
+        break;
+    case 0xe10:
+        sp->fifointenset |= val & FIFOINT_MASK;
+        break;
+    case 0xe14:
+        sp->fifointenset &= ~(val & FIFOINT_MASK);
+        break;
+    case 0xe20:
+        rt6xx_flexcomm_spi_frame(s, val);
+        break;
+    case 0x428:
+    case 0xe18:
+    case 0xe30:
+    case 0xe40:
+    case 0xe48:
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented SPI write at 0x%03"
+                      HWADDR_PRIx " value 0x%08x\n",
+                      TYPE_RT6XX_FLEXCOMM, offset, val);
+        break;
+    }
+}
+
+static void rt6xx_flexcomm_spi_reset_state(Rt6xxFlexcommState *s)
+{
+    Rt6xxFlexcommSpiState *sp = &s->spi;
+
+    sp->cfg = 0;
+    sp->dly = 0;
+    sp->stat = 0;
+    sp->inten = 0;
+    sp->div = 0;
+    sp->fifocfg = 0;
+    sp->fifoerr = 0;
+    sp->fifotrig = 0;
+    sp->fifointenset = 0;
+    memset(sp->rx_fifo, 0, sizeof(sp->rx_fifo));
+    sp->rx_head = 0;
+    sp->rx_count = 0;
+    sp->ssel = 0;
+    rt6xx_flexcomm_spi_update_cs(s);
+}
+
 static bool rt6xx_flexcomm_active(Rt6xxFlexcommState *s)
 {
     return s->clock_enabled && !s->reset_asserted &&
@@ -405,7 +740,15 @@ static void rt6xx_flexcomm_update_irq(Rt6xxFlexcommState *s)
             level = sources != 0;
             break;
         case RT6XX_FLEXCOMM_PERIPH_SPI:
-            /* Added with the SPI master model. */
+            if (s->spi.cfg & SPI_CFG_ENABLE) {
+                uint32_t peripheral =
+                    rt6xx_flexcomm_spi_peripheral_irq(s);
+                uint32_t fifo = rt6xx_flexcomm_spi_fifointstat(s) &
+                                s->spi.fifointenset & FIFOINT_MASK;
+
+                sources = peripheral | fifo;
+                level = sources != 0;
+            }
             break;
         default:
             break;
@@ -474,6 +817,8 @@ static void rt6xx_flexcomm_reset_registers(Rt6xxFlexcommState *s)
     }
     i->slvqual0 = 0;
     i->phase = RT6XX_I2C_IDLE;
+
+    rt6xx_flexcomm_spi_reset_state(s);
 
     s->pselid = rt6xx_flexcomm_caps_present(s);
 }
@@ -547,6 +892,15 @@ static uint64_t rt6xx_flexcomm_read(void *opaque, hwaddr offset, unsigned size)
 
     if (!rt6xx_flexcomm_check_access(s, offset)) {
         return 0;
+    }
+
+    if (rt6xx_flexcomm_selected(s) == RT6XX_FLEXCOMM_PERIPH_SPI &&
+        ((offset >= 0x400 && offset <= 0x7ff) ||
+         (offset >= 0xe00 && offset < 0xff8))) {
+        uint64_t result = rt6xx_flexcomm_spi_read(s, offset);
+
+        rt6xx_flexcomm_update_irq(s);
+        return result;
     }
 
     switch (offset) {
@@ -625,6 +979,14 @@ static void rt6xx_flexcomm_write(void *opaque, hwaddr offset,
         return;
     }
 
+    if (rt6xx_flexcomm_selected(s) == RT6XX_FLEXCOMM_PERIPH_SPI &&
+        ((offset >= 0x400 && offset <= 0x7ff) ||
+         (offset >= 0xe00 && offset < 0xff8))) {
+        rt6xx_flexcomm_spi_write(s, offset, val);
+        rt6xx_flexcomm_update_irq(s);
+        return;
+    }
+
     if (offset >= 0x800 && offset <= 0xbff) {
         rt6xx_flexcomm_i2c_write(s, offset, val);
         rt6xx_flexcomm_update_irq(s);
@@ -698,6 +1060,9 @@ static void rt6xx_flexcomm_write(void *opaque, hwaddr offset,
                 if (old_sel == RT6XX_FLEXCOMM_PERIPH_I2C) {
                     rt6xx_flexcomm_i2c_abort(s);
                 }
+                if (old_sel == RT6XX_FLEXCOMM_PERIPH_SPI) {
+                    rt6xx_flexcomm_spi_set_ssel(s, 0);
+                }
                 trace_rt6xx_flexcomm_sel(DEVICE(s)->canonical_path, sel);
             }
         }
@@ -765,6 +1130,11 @@ static int rt6xx_flexcomm_post_load(void *opaque, int version_id)
         i->slvqual0 = 0;
         i->phase = RT6XX_I2C_IDLE;
     }
+    if (version_id < 3) {
+        rt6xx_flexcomm_spi_reset_state(s);
+    } else {
+        rt6xx_flexcomm_spi_update_cs(s);
+    }
     rt6xx_flexcomm_update_irq(s);
     qemu_chr_fe_accept_input(&s->chr);
     return 0;
@@ -781,7 +1151,7 @@ static int rt6xx_flexcomm_pre_save(void *opaque)
 
 static const VMStateDescription vmstate_rt6xx_flexcomm = {
     .name = TYPE_RT6XX_FLEXCOMM,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .pre_save = rt6xx_flexcomm_pre_save,
     .post_load = rt6xx_flexcomm_post_load,
@@ -816,6 +1186,20 @@ static const VMStateDescription vmstate_rt6xx_flexcomm = {
         VMSTATE_UINT32_ARRAY_V(i2c.slvadr, Rt6xxFlexcommState, 4, 2),
         VMSTATE_UINT32_V(i2c.slvqual0, Rt6xxFlexcommState, 2),
         VMSTATE_UINT8_V(i2c.phase, Rt6xxFlexcommState, 2),
+        VMSTATE_UINT32_V(spi.cfg, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.dly, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.stat, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.inten, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.div, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.fifocfg, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.fifoerr, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.fifotrig, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_V(spi.fifointenset, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT32_ARRAY_V(spi.rx_fifo, Rt6xxFlexcommState,
+                               RT6XX_FLEXCOMM_FIFO_SIZE, 3),
+        VMSTATE_UINT8_V(spi.rx_head, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT8_V(spi.rx_count, Rt6xxFlexcommState, 3),
+        VMSTATE_UINT8_V(spi.ssel, Rt6xxFlexcommState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -823,12 +1207,17 @@ static const VMStateDescription vmstate_rt6xx_flexcomm = {
 static void rt6xx_flexcomm_realize(DeviceState *dev, Error **errp)
 {
     Rt6xxFlexcommState *s = RT6XX_FLEXCOMM(dev);
-    g_autofree char *bus_name = NULL;
+    const char *component = object_get_canonical_path_component(OBJECT(dev));
+    g_autofree char *i2c_bus_name = NULL;
+    g_autofree char *spi_bus_name = NULL;
 
     if (s->capabilities & RT6XX_FLEXCOMM_CAP_I2C) {
-        bus_name = g_strdup_printf("%s.i2c",
-                    object_get_canonical_path_component(OBJECT(dev)));
-        s->i2c_bus = i2c_init_bus(dev, bus_name);
+        i2c_bus_name = g_strdup_printf("%s.i2c", component);
+        s->i2c_bus = i2c_init_bus(dev, i2c_bus_name);
+    }
+    if (s->capabilities & RT6XX_FLEXCOMM_CAP_SPI) {
+        spi_bus_name = g_strdup_printf("%s.spi", component);
+        s->spi_bus = ssi_create_bus(dev, spi_bus_name);
     }
     qemu_chr_fe_set_handlers(&s->chr, rt6xx_flexcomm_can_receive,
                              rt6xx_flexcomm_receive, NULL, NULL,

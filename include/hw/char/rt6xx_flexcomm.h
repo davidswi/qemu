@@ -9,6 +9,8 @@
 
 #include "chardev/char-fe.h"
 #include "hw/core/sysbus.h"
+#include "hw/i2c/i2c.h"
+#include "hw/ssi/ssi.h"
 #include "qom/object.h"
 
 #define TYPE_RT6XX_FLEXCOMM "rt6xx-flexcomm"
@@ -37,6 +39,32 @@ typedef enum Rt6xxFlexcommPeriph {
     RT6XX_FLEXCOMM_PERIPH_I2C = 3,
 } Rt6xxFlexcommPeriph;
 
+/* I2C master state machine phase; matches STAT.MSTSTATE encoding. */
+typedef enum Rt6xxFlexcommI2cPhase {
+    RT6XX_I2C_IDLE = 0,
+    RT6XX_I2C_RX_READY = 1,
+    RT6XX_I2C_TX_READY = 2,
+    RT6XX_I2C_NACK_ADDR = 3,
+    RT6XX_I2C_NACK_DATA = 4,
+} Rt6xxFlexcommI2cPhase;
+
+typedef struct Rt6xxFlexcommI2cState {
+    uint32_t cfg;
+    uint32_t stat;          /* sticky write-one-to-clear flags only */
+    uint32_t inten;
+    uint32_t timeout;       /* TO field; TOMIN always reads as 0xf */
+    uint32_t clkdiv;
+    uint32_t mstctl;        /* MSTDMA storage; command bits self-clear */
+    uint32_t mstime;
+    uint32_t mstdat;
+    uint32_t slvctl;
+    uint32_t slvdat;
+    uint32_t slvadr[4];
+    uint32_t slvqual0;
+    uint8_t phase;
+    bool bus_active;        /* this master owns an open QEMU transfer */
+} Rt6xxFlexcommI2cState;
+
 typedef struct Rt6xxFlexcommUsartState {
     uint32_t cfg;
     uint32_t ctl;
@@ -64,7 +92,11 @@ struct Rt6xxFlexcommState {
     bool clock_enabled;
     bool reset_asserted;
 
+    I2CBus *i2c_bus;
+    SSIBus *spi_bus;
+
     Rt6xxFlexcommUsartState usart;
+    Rt6xxFlexcommI2cState i2c;
 };
 
 #endif

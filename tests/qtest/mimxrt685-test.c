@@ -34,6 +34,14 @@ static void enable_flexcomm0(QTestState *s)
     qtest_writel(s, FC0 + 0x000, 1);
 }
 
+static void enable_flexcomm15_i2c(QTestState *s)
+{
+    qtest_writel(s, CLKCTL1 + 0x040, BIT(23));
+    qtest_writel(s, RSTCTL1 + 0x070, BIT(23));
+    qtest_writel(s, FC15 + 0xff8, 3);
+    qtest_writel(s, FC15 + 0x800, BIT(0));
+}
+
 static void enable_gpio0(QTestState *s)
 {
     qtest_writel(s, CLKCTL1 + 0x044, BIT(0));
@@ -357,6 +365,61 @@ static void test_flexcomm_uart(void)
     qtest_quit(s);
 }
 
+static void test_flexcomm_i2c(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk "
+                               "-device tmp105,bus=flexcomm15.i2c,"
+                               "address=0x48");
+
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+    enable_flexcomm15_i2c(s);
+
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x804), ==, 0x00000801);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x810), ==, 0x0000ffff);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x824), ==, 0x00000077);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x848), ==, 0x00000001);
+
+    /* Pending is a level interrupt while the master waits for software. */
+    qtest_writel(s, FC15 + 0x808, BIT(0));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x818), ==, BIT(0));
+    g_assert_true(qtest_get_irq(s, 21));
+    qtest_writel(s, FC15 + 0x80c, BIT(0));
+    g_assert_false(qtest_get_irq(s, 21));
+
+    /* Select the TMP105 configuration register and write 0x60. */
+    qtest_writel(s, FC15 + 0x828, 0x48 << 1);
+    qtest_writel(s, FC15 + 0x820, BIT(1));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x804) & 0xf, ==, 0x5);
+    qtest_writel(s, FC15 + 0x828, 0x01);
+    qtest_writel(s, FC15 + 0x820, BIT(0));
+    qtest_writel(s, FC15 + 0x828, 0x60);
+    qtest_writel(s, FC15 + 0x820, BIT(0));
+    qtest_writel(s, FC15 + 0x820, BIT(2));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x804) & 0xf, ==, 0x1);
+
+    /* Read the value back using the SDK-style repeated START sequence. */
+    qtest_writel(s, FC15 + 0x828, 0x48 << 1);
+    qtest_writel(s, FC15 + 0x820, BIT(1));
+    qtest_writel(s, FC15 + 0x828, 0x01);
+    qtest_writel(s, FC15 + 0x820, BIT(0));
+    qtest_writel(s, FC15 + 0x828, (0x48 << 1) | 1);
+    qtest_writel(s, FC15 + 0x820, BIT(1));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x804) & 0xf, ==, 0x3);
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x828), ==, 0x60);
+    qtest_writel(s, FC15 + 0x820, BIT(2));
+
+    /* Address NACK is reported as pending master state 3. */
+    qtest_writel(s, FC15 + 0x828, 0x7f << 1);
+    qtest_writel(s, FC15 + 0x820, BIT(1));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0x804) & 0xf, ==, 0x7);
+    qtest_writel(s, FC15 + 0x820, BIT(2));
+
+    qtest_writel(s, RSTCTL1 + 0x040, BIT(23));
+    g_assert_cmphex(qtest_readl(s, FC15 + 0xff8), ==,
+                    FC_PSELID_PRESENT_I2C);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -376,5 +439,6 @@ int main(int argc, char **argv)
                    test_gpio_registers_and_irq);
     qtest_add_func("/mimxrt685/flexcomm-topology", test_flexcomm_topology);
     qtest_add_func("/mimxrt685/flexcomm-uart", test_flexcomm_uart);
+    qtest_add_func("/mimxrt685/flexcomm-i2c", test_flexcomm_i2c);
     return g_test_run();
 }

@@ -68,3 +68,6 @@ config AVR_TIMER16
 
 config HEX_QTIMER
     bool
+
+config RT6XX_OSTIMER
+    bool

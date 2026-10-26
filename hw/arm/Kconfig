@@ -353,6 +353,7 @@ config IMXRT685_SOC
     select ARM_V7M
     select RT6XX_FLEXCOMM
     select RT6XX_GPIO
+    select RT6XX_OSTIMER
     select RT6XX_RSTCTL
     select RT6XX_SYSCON
 

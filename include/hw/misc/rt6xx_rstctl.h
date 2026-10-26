@@ -27,6 +27,7 @@ struct Rt6xxRstctlState {
     uint32_t variant;
     qemu_irq flexcomm_reset[10];
     qemu_irq gpio_reset[8];
+    qemu_irq ostimer_reset;
 };
 
 #endif

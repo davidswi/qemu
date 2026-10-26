@@ -10,11 +10,14 @@
 #define HW_ARM_IMXRT685_H
 
 #include "hw/arm/armv7m.h"
+#include "hw/audio/rt685_audio_link.h"
+#include "hw/audio/wm8904.h"
 #include "hw/char/rt6xx_flexcomm.h"
 #include "hw/gpio/rt6xx_gpio.h"
 #include "hw/gpio/rt6xx_iopctl.h"
 #include "hw/misc/rt6xx_rstctl.h"
 #include "hw/misc/rt6xx_syscon.h"
+#include "hw/timer/rt6xx_ostimer.h"
 #include "qom/object.h"
 
 #define TYPE_IMXRT685_SOC "imxrt685-soc"
@@ -39,6 +42,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMXRT685State, IMXRT685_SOC)
 #define IMXRT685_CLKCTL1_BASE   0x40021000ULL
 #define IMXRT685_SYSCTL1_BASE   0x40022000ULL
 #define IMXRT685_GPIO_BASE      0x40100000ULL
+#define IMXRT685_OSTIMER_BASE   0x40113000ULL
 
 struct IMXRT685State {
     SysBusDevice parent_obj;
@@ -53,7 +57,10 @@ struct IMXRT685State {
     Rt6xxRstctlState rstctl[2];
     Rt6xxIopctlState iopctl;
     Rt6xxGpioState gpio;
+    Rt6xxOSTimerState ostimer;
     Rt6xxFlexcommState flexcomm[10];
+    Rt685AudioLink audio_link;
+    I2CSlave *wm8904;           /* created during realize */
     char *cpu_type;
 };
 

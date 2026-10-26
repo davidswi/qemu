@@ -18,6 +18,7 @@
 #define CLKCTL1 0x40021000
 #define SYSCTL1 0x40022000
 #define GPIO    0x40100000
+#define OSTIMER 0x40113000
 #define FC0     0x40106000
 #define FC14    0x40126000
 #define FC15    0x40127000
@@ -25,6 +26,30 @@
 #define FC_PSELID_PRESENT_ALL 0x001010f0
 #define FC_PSELID_PRESENT_SPI 0x00101020
 #define FC_PSELID_PRESENT_I2C 0x00101040
+#define FC14_PATH "/machine/soc/flexcomm14"
+
+static uint64_t gray_to_binary(uint64_t gray)
+{
+    uint64_t binary = gray;
+
+    for (unsigned shift = 1; shift < 64; shift <<= 1) {
+        binary ^= binary >> shift;
+    }
+    return binary;
+}
+
+static uint64_t binary_to_gray(uint64_t binary)
+{
+    return binary ^ (binary >> 1);
+}
+
+static uint64_t read_ostimer(QTestState *s)
+{
+    uint64_t raw = qtest_readl(s, OSTIMER);
+
+    raw |= (uint64_t)qtest_readl(s, OSTIMER + 4) << 32;
+    return gray_to_binary(raw);
+}
 
 static void enable_flexcomm0(QTestState *s)
 {
@@ -272,6 +297,49 @@ static void test_gpio_registers_and_irq(void)
     qtest_quit(s);
 }
 
+static void test_ostimer_counter_match_and_gating(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+    uint64_t before, after, match, raw_match;
+
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+
+    /* CLKCTL1.PSCCTL0 bit 27 gates the 1 MHz OS/Event timer. */
+    before = read_ostimer(s);
+    qtest_clock_step(s, 10 * 1000);
+    g_assert_cmpuint(read_ostimer(s), ==, before);
+    qtest_writel(s, CLKCTL1 + 0x040, BIT(27));
+    qtest_clock_step(s, 10 * 1000);
+    after = read_ostimer(s);
+    g_assert_cmpuint(after - before, ==, 10);
+
+    /* MATCH is Gray encoded and raises OS_EVENT_IRQn (41). */
+    match = after + 100;
+    raw_match = binary_to_gray(match);
+    qtest_writel(s, OSTIMER + 0x10, raw_match);
+    qtest_writel(s, OSTIMER + 0x14, raw_match >> 32);
+    qtest_writel(s, OSTIMER + 0x1c, BIT(1));
+    qtest_clock_step(s, 99 * 1000);
+    g_assert_false(qtest_get_irq(s, 41));
+    qtest_clock_step(s, 1000);
+    g_assert_cmphex(qtest_readl(s, OSTIMER + 0x1c), ==, BIT(0) | BIT(1));
+    g_assert_true(qtest_get_irq(s, 41));
+    qtest_writel(s, OSTIMER + 0x1c, BIT(0) | BIT(1));
+    g_assert_false(qtest_get_irq(s, 41));
+
+    /* Clock gating freezes the counter; reset clears local and count state. */
+    qtest_writel(s, CLKCTL1 + 0x070, BIT(27));
+    before = read_ostimer(s);
+    qtest_clock_step(s, 20 * 1000);
+    g_assert_cmpuint(read_ostimer(s), ==, before);
+    qtest_writel(s, RSTCTL1 + 0x040, BIT(27));
+    g_assert_cmpuint(read_ostimer(s), ==, 0);
+    g_assert_cmphex(qtest_readl(s, OSTIMER + 0x10), ==, 0);
+    g_assert_cmphex(qtest_readl(s, OSTIMER + 0x1c), ==, 0);
+
+    qtest_quit(s);
+}
+
 static void test_flexcomm_topology(void)
 {
     static const uint32_t fc_base[] = {
@@ -515,6 +583,116 @@ static void test_flexcomm_spi(void)
     qtest_quit(s);
 }
 
+static void test_flexcomm_spi_slave(void)
+{
+    uint32_t stat;
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+    enable_flexcomm14_spi(s);
+
+    /* Start with all active-low SSEL inputs inactive, then enable slave. */
+    for (unsigned i = 0; i < 4; i++) {
+        qtest_set_irq_in(s, FC14_PATH, "spi-slave-ssel", i, 1);
+    }
+    qtest_writel(s, FC14 + 0xe00, BIT(0) | BIT(1));
+    qtest_writel(s, FC14 + 0x400, BIT(0));
+    g_assert_cmphex(qtest_readl(s, FC14 + 0x408), ==, BIT(8));
+
+    /* SSEL assertion is sticky and can interrupt in slave mode. */
+    qtest_writel(s, FC14 + 0x40c, BIT(4) | BIT(5));
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-ssel", 0, 0);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0x408), ==, BIT(8) | BIT(4));
+    g_assert_true(qtest_get_irq(s, 20));
+    qtest_writel(s, FC14 + 0x408, BIT(4));
+    g_assert_false(qtest_get_irq(s, 20));
+
+    /* A master frame consumes one TX word and produces SSEL/SOT RX metadata. */
+    qtest_writel(s, FC14 + 0xe20, (7U << 24) | 0xa5);
+    stat = qtest_readl(s, FC14 + 0xe04);
+    g_assert_cmpuint(extract32(stat, 8, 5), ==, 1);
+    qtest_writel(s, FC14 + 0xe08, BIT(1));
+    qtest_writel(s, FC14 + 0xe10, BIT(3));
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-frame", 0, 0x5a);
+    stat = qtest_readl(s, FC14 + 0xe04);
+    g_assert_cmpuint(extract32(stat, 8, 5), ==, 0);
+    g_assert_cmpuint(extract32(stat, 16, 5), ==, 1);
+    g_assert_true(qtest_get_irq(s, 20));
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xe40), ==, 0x001e005a);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xe30), ==, 0x001e005a);
+    g_assert_false(qtest_get_irq(s, 20));
+
+    /* An unprepared slave transmission reports TX underrun. */
+    qtest_writel(s, FC14 + 0xe10, BIT(0));
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-frame", 0, 0x33);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xe04) & BIT(0), ==, BIT(0));
+    g_assert_true(qtest_get_irq(s, 20));
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xe30), ==, 0x000e0033);
+    g_assert_true(qtest_get_irq(s, 20));
+    qtest_writel(s, FC14 + 0xe04, BIT(0));
+    g_assert_false(qtest_get_irq(s, 20));
+
+    /* TXIGNORE establishes persistent receive-only operation. */
+    qtest_writel(s, FC14 + 0xe20, (7U << 24) | BIT(23));
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-frame", 0, 0x44);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xe04) & BIT(0), ==, 0);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0xe30), ==, 0x000e0044);
+
+    /* RXIGNORE suppresses the corresponding received frame. */
+    qtest_writel(s, FC14 + 0xe20, (7U << 24) | BIT(22) | 0x66);
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-frame", 0, 0x55);
+    g_assert_cmpuint(extract32(qtest_readl(s, FC14 + 0xe04), 16, 5),
+                     ==, 0);
+
+    /* A seventeenth queued slave response is rejected as TX overflow. */
+    for (unsigned i = 0; i < 17; i++) {
+        qtest_writel(s, FC14 + 0xe20, (7U << 24) | i);
+    }
+    stat = qtest_readl(s, FC14 + 0xe04);
+    g_assert_cmphex(stat & BIT(0), ==, BIT(0));
+    g_assert_cmpuint(extract32(stat, 8, 5), ==, 16);
+    qtest_writel(s, FC14 + 0xe04, BIT(0));
+
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-ssel", 0, 1);
+    g_assert_cmphex(qtest_readl(s, FC14 + 0x408), ==, BIT(8) | BIT(5));
+    g_assert_true(qtest_get_irq(s, 20));
+    qtest_writel(s, FC14 + 0x408, BIT(5));
+    g_assert_false(qtest_get_irq(s, 20));
+
+    /* FIFO reset commands clear both independently maintained queues. */
+    qtest_writel(s, FC14 + 0xe00,
+                 BIT(16) | BIT(17) | BIT(0) | BIT(1));
+    stat = qtest_readl(s, FC14 + 0xe04);
+    g_assert_cmpuint(extract32(stat, 8, 5), ==, 0);
+    g_assert_cmpuint(extract32(stat, 16, 5), ==, 0);
+
+    qtest_quit(s);
+}
+
+static void test_flexcomm_spi_slave_miso(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    qtest_irq_intercept_out_named(s, FC14_PATH, "spi-slave-miso");
+    enable_flexcomm14_spi(s);
+    for (unsigned i = 0; i < 4; i++) {
+        qtest_set_irq_in(s, FC14_PATH, "spi-slave-ssel", i, 1);
+    }
+    qtest_writel(s, FC14 + 0xe00, BIT(0) | BIT(1));
+    qtest_writel(s, FC14 + 0x400, BIT(0));
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-ssel", 0, 0);
+
+    qtest_writel(s, FC14 + 0xe20, (7U << 24) | 0xa5);
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-frame", 0, 0x5a);
+    g_assert_true(qtest_get_irq(s, 0));
+
+    qtest_writel(s, FC14 + 0xe20, (7U << 24));
+    qtest_set_irq_in(s, FC14_PATH, "spi-slave-frame", 0, 0x5a);
+    g_assert_false(qtest_get_irq(s, 0));
+
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -532,9 +710,15 @@ int main(int argc, char **argv)
     qtest_add_func("/mimxrt685/reset-and-iopctl", test_reset_and_iopctl);
     qtest_add_func("/mimxrt685/gpio-registers-and-irq",
                    test_gpio_registers_and_irq);
+    qtest_add_func("/mimxrt685/ostimer-counter-match-and-gating",
+                   test_ostimer_counter_match_and_gating);
     qtest_add_func("/mimxrt685/flexcomm-topology", test_flexcomm_topology);
     qtest_add_func("/mimxrt685/flexcomm-uart", test_flexcomm_uart);
     qtest_add_func("/mimxrt685/flexcomm-i2c", test_flexcomm_i2c);
     qtest_add_func("/mimxrt685/flexcomm-spi", test_flexcomm_spi);
+    qtest_add_func("/mimxrt685/flexcomm-spi-slave",
+                   test_flexcomm_spi_slave);
+    qtest_add_func("/mimxrt685/flexcomm-spi-slave-miso",
+                   test_flexcomm_spi_slave_miso);
     return g_test_run();
 }

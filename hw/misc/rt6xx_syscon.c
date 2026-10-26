@@ -145,6 +145,18 @@ static const Rt6xxRegInfo clkctl1_regs[] = {
     REG(0x6e4, 0xff, 0xffff, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
     REG(0x6e8, 7, 7, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
     REG(0x6fc, 0x40000000, 0xe00000ff, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
+    /* Audio MCLK output selector/divider and the I3C0 functional
+     * clock tree.  The I3C0 registers are functional storage: the
+     * RT685 I3C controller is not modeled and the EVK codec adapter
+     * uses the Flexcomm 4 I2C fallback here.
+     */
+    REG(0x740, 0x7, 0x7, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
+    REG(0x744, 0x40000000, 0xe00000ff, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
+    REG(0x780, 0x7, 0x7, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
+    REG(0x784, 0x7, 0x7, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
+    REG(0x788, 0x40000000, 0xe00000ff, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
+    REG(0x78c, 0x40000000, 0xe00000ff, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
+    REG(0x790, 0x40000000, 0xe00000ff, RT6XX_WM_MASKED, RT6XX_NO_ALIAS),
 };
 
 /* SYSCTL0 */
@@ -253,7 +265,8 @@ static uint32_t rt6xx_reg_value(Rt6xxSysconState *s, hwaddr offset)
 static bool rt6xx_is_clock_divider(Rt6xxSysconState *s, hwaddr offset)
 {
     if (s->variant == RT6XX_CLKCTL1) {
-        return offset == 0x400;
+        return offset == 0x400 || offset == 0x744 || offset == 0x788 ||
+               offset == 0x78c || offset == 0x790;
     }
     if (s->variant != RT6XX_CLKCTL0) {
         return false;
@@ -338,6 +351,7 @@ static void rt6xx_update_outputs(Rt6xxSysconState *s)
             qemu_set_irq(s->flexcomm_clock[i],
                          extract32(gates, rt6xx_flexcomm_ctl_bit[i], 1));
         }
+        qemu_set_irq(s->ostimer_clock, extract32(gates, 27, 1));
         gates = rt6xx_reg_value(s, 0x014);
         for (unsigned i = 0; i < ARRAY_SIZE(s->gpio_clock); i++) {
             qemu_set_irq(s->gpio_clock[i], extract32(gates, i, 1));
@@ -477,6 +491,7 @@ static void rt6xx_syscon_init(Object *obj)
                              "flexcomm-clock",
                              ARRAY_SIZE(s->flexcomm_clock));
     qdev_init_gpio_out_named(dev, s->gpio_clock, "gpio-clock", 8);
+    qdev_init_gpio_out_named(dev, &s->ostimer_clock, "ostimer-clock", 1);
     qdev_init_gpio_in_named(dev, rt6xx_ffro_enable, "ffro-enable-in", 1);
     s->cpuclk = qdev_init_clock_out(dev, "cpuclk");
 }

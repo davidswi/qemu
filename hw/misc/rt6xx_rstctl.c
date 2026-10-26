@@ -46,6 +46,7 @@ static void rt6xx_rstctl_update_outputs(Rt6xxRstctlState *s)
         qemu_set_irq(s->flexcomm_reset[i],
                      extract32(s->prstctl[0], rt6xx_flexcomm_ctl_bit[i], 1));
     }
+    qemu_set_irq(s->ostimer_reset, extract32(s->prstctl[0], 27, 1));
     for (unsigned i = 0; i < ARRAY_SIZE(s->gpio_reset); i++) {
         qemu_set_irq(s->gpio_reset[i], extract32(s->prstctl[1], i, 1));
     }
@@ -167,6 +168,7 @@ static void rt6xx_rstctl_init(Object *obj)
     qdev_init_gpio_out_named(dev, s->flexcomm_reset, "flexcomm-reset",
                              ARRAY_SIZE(s->flexcomm_reset));
     qdev_init_gpio_out_named(dev, s->gpio_reset, "gpio-reset", 8);
+    qdev_init_gpio_out_named(dev, &s->ostimer_reset, "ostimer-reset", 1);
 }
 
 static const Property rt6xx_rstctl_properties[] = {

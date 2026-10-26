@@ -1,4 +1,5 @@
 system_ss.add(files('model.c'))
+system_ss.add(when: 'CONFIG_RT685_AUDIO', if_true: files('wm8904.c', 'rt685_audio_link.c'))
 system_ss.add(when: 'CONFIG_AC97', if_true: files('ac97.c'))
 system_ss.add(when: 'CONFIG_ADLIB', if_true: files('fmopl.c', 'adlib.c'))
 system_ss.add(when: 'CONFIG_ASC', if_true: files('asc.c'))

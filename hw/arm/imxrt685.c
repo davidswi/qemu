@@ -65,6 +65,8 @@ static void imxrt685_init(Object *obj)
                             TYPE_RT6XX_RSTCTL);
     object_initialize_child(obj, "iopctl", &s->iopctl, TYPE_RT6XX_IOPCTL);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_RT6XX_GPIO);
+    object_initialize_child(obj, "ostimer", &s->ostimer,
+                            TYPE_RT6XX_OSTIMER);
     for (unsigned i = 0; i < ARRAY_SIZE(flexcomm_desc); i++) {
         g_autofree char *name =
             g_strdup_printf("flexcomm%u", flexcomm_desc[i].hwnum);
@@ -72,6 +74,8 @@ static void imxrt685_init(Object *obj)
         object_initialize_child(obj, name, &s->flexcomm[i],
                                 TYPE_RT6XX_FLEXCOMM);
     }
+    object_initialize_child(obj, "audio-link", &s->audio_link,
+                            TYPE_RT685_AUDIO_LINK);
 }
 
 static bool imxrt685_realize_syscon(Rt6xxSysconState *s, unsigned variant,
@@ -222,10 +226,54 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 1,
                        qdev_get_gpio_in(armv7m, 3));
 
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ostimer), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->ostimer), 0,
+                    IMXRT685_OSTIMER_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->ostimer), 0,
+                       qdev_get_gpio_in(armv7m, 41));
+    qdev_connect_gpio_out_named(DEVICE(&s->clkctl[1]), "ostimer-clock", 0,
+                                qdev_get_gpio_in_named(
+                                    DEVICE(&s->ostimer),
+                                    "clock-enabled", 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->rstctl[1]), "ostimer-reset", 0,
+                                qdev_get_gpio_in_named(
+                                    DEVICE(&s->ostimer), "reset", 0));
+
+    /*
+     * EVK digital audio wiring: Flexcomm 1 (I2S RX, shared SCK/WS
+     * clock master) and Flexcomm 3 (I2S TX, clock slave) exchange
+     * frames through the on-board WM8904 under a single board-owned
+     * 48 kHz cadence.  The codec control plane uses the SDK I2C
+     * fallback on Flexcomm 4 at address 0x1a; the RT685 I3C
+     * controller is not modeled here.
+     */
+    {
+        Object *link = OBJECT(&s->audio_link);
+
+        s->wm8904 = i2c_slave_new(TYPE_WM8904, 0x1a);
+        object_property_set_link(link, "rx", OBJECT(&s->flexcomm[1]),
+                                 &error_abort);
+        object_property_set_link(link, "tx", OBJECT(&s->flexcomm[3]),
+                                 &error_abort);
+        /* Set before realize: the link property is realize-locked. */
+        object_property_set_link(link, "codec", OBJECT(s->wm8904),
+                                 &error_abort);
+        if (!sysbus_realize(SYS_BUS_DEVICE(link), errp)) {
+            return;
+        }
+    }
+
     for (unsigned i = 0; i < ARRAY_SIZE(flexcomm_desc); i++) {
         const struct Rt6xxFlexcommDesc *d = &flexcomm_desc[i];
         DeviceState *fc = DEVICE(&s->flexcomm[i]);
 
+        if (i == 1 || i == 3) {
+            object_property_set_link(OBJECT(fc), "audio-link",
+                                     OBJECT(&s->audio_link),
+                                     &error_abort);
+        }
         /* Only Flexcomm 0..7 contain a USART; do not consume serial
          * backends for the SPI-only and I2C-only instances. */
         if (d->caps & RT6XX_FLEXCOMM_CAP_USART) {
@@ -254,6 +302,11 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
         qdev_connect_gpio_out_named(DEVICE(&s->rstctl[1]), "gpio-reset", i,
                                     qdev_get_gpio_in_named(DEVICE(&s->gpio),
                                         "reset", i));
+    }
+
+    if (!i2c_slave_realize_and_unref(s->wm8904, s->flexcomm[4].i2c_bus,
+                                     errp)) {
+        return;
     }
 }
 

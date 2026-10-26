@@ -35,6 +35,7 @@ struct Rt6xxSysconState {
     qemu_irq ffro_enable_out;
     qemu_irq flexcomm_clock[10];
     qemu_irq gpio_clock[8];
+    qemu_irq ostimer_clock;
     Clock *cpuclk;
 };
 

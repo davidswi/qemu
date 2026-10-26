@@ -51,3 +51,7 @@ config VIRTIO_SND
     bool
     default y
     depends on VIRTIO
+
+config RT685_AUDIO
+    bool
+    select I2C

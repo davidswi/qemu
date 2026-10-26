@@ -20,6 +20,7 @@
 #define GPIO    0x40100000
 #define OSTIMER 0x40113000
 #define FC0     0x40106000
+#define FC3     0x40109000
 #define FC14    0x40126000
 #define FC15    0x40127000
 
@@ -693,6 +694,34 @@ static void test_flexcomm_spi_slave_miso(void)
     qtest_quit(s);
 }
 
+static void test_flexcomm_i2s_tx_level_irq(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+    qtest_writel(s, CLKCTL1 + 0x040, BIT(11));
+    qtest_writel(s, RSTCTL1 + 0x070, BIT(11));
+    qtest_writel(s, FC3 + 0xff8, 4); /* I2S TX */
+
+    qtest_writel(s, FC3 + 0xe00, BIT(0) | BIT(2));
+    qtest_writel(s, FC3 + 0xe08, BIT(0) | (4U << 8));
+    qtest_writel(s, FC3 + 0xe10, BIT(2));
+    qtest_writel(s, FC3 + 0xc00, BIT(0));
+
+    /* Empty FIFO is at/below the four-word TX watermark. */
+    g_assert_true(qtest_get_irq(s, 17));
+
+    /* The fifth word moves the FIFO above the watermark immediately. */
+    for (unsigned i = 0; i < 5; i++) {
+        qtest_writel(s, FC3 + 0xe20, 0x10000U + i);
+    }
+    g_assert_false(qtest_get_irq(s, 17));
+
+    qtest_writel(s, FC3 + 0xe14, BIT(2));
+    g_assert_false(qtest_get_irq(s, 17));
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -720,5 +749,7 @@ int main(int argc, char **argv)
                    test_flexcomm_spi_slave);
     qtest_add_func("/mimxrt685/flexcomm-spi-slave-miso",
                    test_flexcomm_spi_slave_miso);
+    qtest_add_func("/mimxrt685/flexcomm-i2s-tx-level-irq",
+                   test_flexcomm_i2s_tx_level_irq);
     return g_test_run();
 }

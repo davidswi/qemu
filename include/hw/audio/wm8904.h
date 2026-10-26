@@ -10,6 +10,7 @@
 #include "hw/audio/rt685_audio_link.h"
 #include "hw/i2c/i2c.h"
 #include "qemu/audio.h"
+#include "qemu/notify.h"
 #include "qom/object.h"
 
 #define TYPE_WM8904 "wm8904"
@@ -52,10 +53,12 @@ struct WM8904State {
     /* Host audio output (owned by this device, not migrated). */
     AudioBackend *audio_be;
     SWVoiceOut *voice;
+    Notifier exit_notifier;
+    bool exit_notifier_registered;
     int16_t playback_ring[PLAYBACK_BUF_SIZE];
     unsigned playback_write;   /* next ring slot to fill          */
     unsigned playback_read;    /* next ring slot to drain         */
-    uint32_t playback_count;   /* frames buffered (left+right)    */
+    uint32_t playback_count;   /* buffered int16_t samples       */
     uint64_t playback_dropped; /* frames dropped on overflow      */
     uint64_t playback_underruns;
     bool voice_active;
@@ -64,7 +67,7 @@ struct WM8904State {
      * Stored as uint32 for property/migration compatibility.
      * 0=tone, 1=ramp, 2=silence. */
     uint32_t capture_mode;      /* raw integer value              */
-    unsigned tone_idx;         /* index into tone_table           */
+    unsigned tone_idx;         /* phase in 1/48000-cycle units    */
 };
 
 #endif /* HW_AUDIO_WM8904_H */

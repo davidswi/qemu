@@ -316,12 +316,6 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
                                  &error_abort);
         object_property_set_link(link, "tx", OBJECT(&s->flexcomm[3]),
                                  &error_abort);
-        /* Set before realize: the link property is realize-locked. */
-        object_property_set_link(link, "codec", OBJECT(s->wm8904),
-                                 &error_abort);
-        if (!sysbus_realize(SYS_BUS_DEVICE(link), errp)) {
-            return;
-        }
     }
 
     for (unsigned i = 0; i < ARRAY_SIZE(flexcomm_desc); i++) {
@@ -367,6 +361,18 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
 
     if (!i2c_slave_realize_and_unref(s->wm8904, s->flexcomm[4].i2c_bus,
                                      errp)) {
+        return;
+    }
+
+    /*
+     * Attach the codec before storing it in the audio link.  QOM link
+     * properties are weak and are cleared when an unparented object is
+     * reparented onto its bus, which would otherwise leave the link without
+     * a codec and prevent its frame timer from ever starting.
+     */
+    object_property_set_link(OBJECT(&s->audio_link), "codec",
+                             OBJECT(s->wm8904), &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->audio_link), errp)) {
         return;
     }
 }

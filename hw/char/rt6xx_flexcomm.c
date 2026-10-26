@@ -991,6 +991,7 @@ static uint64_t rt6xx_flexcomm_i2s_read(Rt6xxFlexcommState *s, hwaddr offset)
         if (offset == 0xe30) {
             i->rx_head = (i->rx_head + 1) % RT6XX_FLEXCOMM_I2S_FIFO_SIZE;
             i->rx_count--;
+            rt6xx_flexcomm_update_irq(s);
         }
         return value;
     }
@@ -1101,6 +1102,13 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
     if (activity_changed) {
         rt6xx_flexcomm_i2s_link_update(s);
     }
+    /*
+     * FIFO level sources are derived from the current register and FIFO
+     * state.  In particular, enabling TXLVL while the FIFO is empty must
+     * assert the interrupt immediately, and filling the FIFO in the ISR
+     * must deassert it once the watermark is exceeded.
+     */
+    rt6xx_flexcomm_update_irq(s);
 }
 
 /* Forward declaration for rt6xx_flexcomm_i2s_on_sample_consumed. */

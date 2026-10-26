@@ -29,6 +29,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qom/object.h"
+#include "system/system.h"
 
 /*
  * Control protocol.  Byte 0 of a write selects an 8-bit register;
@@ -183,7 +184,6 @@ static const int16_t tone_table[] = {
 static void wm8904_audio_out_callback(void *opaque, int avail_bytes)
 {
     WM8904State *wm = opaque;
-    int16_t tmp_buf[512];  /* batch up to 256 stereo frames per write */
     unsigned read_pos = wm->playback_read;
     uint32_t count = wm->playback_count;
     bool was_empty = (count == 0);
@@ -192,42 +192,26 @@ static void wm8904_audio_out_callback(void *opaque, int avail_bytes)
         return;
     }
 
-    while (count > 0 && avail_bytes >= 4) {
-        unsigned batch = MIN(count, ARRAY_SIZE(tmp_buf));
-        int16_t *dst = tmp_buf;
+    while (count >= 2 && avail_bytes >= 4) {
+        unsigned samples = MIN(count, PLAYBACK_BUF_SIZE - read_pos);
+        size_t written;
 
-        /* Drain contiguous frames from the ring, handling wrap in one or two
-         * memcpy calls. */
-        unsigned end_of_contig = PLAYBACK_BUF_SIZE - read_pos;
-        if (batch < end_of_contig) {
-            /* All batch fits before wrap */
-            memcpy(dst, &wm->playback_ring[read_pos], batch * sizeof(int16_t));
-            read_pos += batch;
-        } else {
-            /* Wrap around: copy up to the end, then from the start. */
-            memcpy(dst, &wm->playback_ring[read_pos],
-                   end_of_contig * sizeof(int16_t));
-            dst += end_of_contig;
-            batch -= end_of_contig;
-            read_pos = 0;
-            if (batch > 0) {
-                memcpy(dst, wm->playback_ring, batch * sizeof(int16_t));
-                read_pos = batch;
-            }
+        samples = MIN(samples, (unsigned)avail_bytes / sizeof(int16_t));
+        samples &= ~1U; /* submit complete stereo frames only */
+        if (!samples) {
+            break;
         }
 
-        size_t written = audio_be_write(wm->audio_be, wm->voice, tmp_buf,
-                                        batch * sizeof(int16_t));
+        written = audio_be_write(wm->audio_be, wm->voice,
+                                 &wm->playback_ring[read_pos],
+                                 samples * sizeof(int16_t));
+        written &= ~3U; /* advance only by complete stereo frames */
         if (written == 0) {
             break;   /* backend temporarily full */
         }
+        read_pos = (read_pos + written / sizeof(int16_t)) % PLAYBACK_BUF_SIZE;
         count -= written / sizeof(int16_t);
-
-        /* Zero out consumed ring entries (for diagnostics). */
-        for (unsigned i = read_pos - (written / sizeof(int16_t));
-             i < read_pos; i++) {
-            wm->playback_ring[i] = 0;
-        }
+        avail_bytes -= written;
     }
 
     wm->playback_read = read_pos;
@@ -249,10 +233,10 @@ static void wm8904_ring_push(WM8904State *wm, uint32_t word)
     int16_t left = (int16_t)(word & 0xffff);
     int16_t right = (int16_t)(word >> 16);
 
-    if (wm->playback_count >= PLAYBACK_BUF_SIZE / 2) {
+    if (wm->playback_count == PLAYBACK_BUF_SIZE) {
         /* Ring full: drop oldest frame to bound latency. */
         wm->playback_read = (wm->playback_read + 2) % PLAYBACK_BUF_SIZE;
-        wm->playback_count--;
+        wm->playback_count -= 2;
         wm->playback_dropped++;
     }
 
@@ -293,17 +277,18 @@ static bool wm8904_endpoint_pop(Rt685AudioEndpoint *ep, uint32_t *word)
 
     switch (wm->capture_mode) {
     case WM8904_CAPTURE_TONE: {
-        /* Fixed-point sine lookup.  Stereo identical channels for a clean
-         * mono test tone that the SDK's record/playback loop reproduces. */
-        int16_t sample = tone_table[wm->tone_idx];
-        left = right = (uint16_t)(sample + 0x8000); /* unsigned 16-bit form */
-        wm->tone_idx = (wm->tone_idx + 1) % TONE_TABLE_SIZE;
+        unsigned table_index =
+            ((uint64_t)wm->tone_idx * TONE_TABLE_SIZE) / 48000;
+        int16_t sample = tone_table[table_index];
+
+        /* I2S and the output voice both carry signed 16-bit PCM. */
+        left = right = (uint16_t)sample;
+        wm->tone_idx = (wm->tone_idx + 440) % 48000;
         break;
     }
     case WM8904_CAPTURE_RAMP: {
         left = (uint16_t)wm->capture_frames;
         right = (uint16_t)(wm->capture_frames + 1);
-        wm->capture_frames++;
         break;
     }
     default: /* SILENCE */
@@ -312,6 +297,7 @@ static bool wm8904_endpoint_pop(Rt685AudioEndpoint *ep, uint32_t *word)
     }
 
     *word = left | ((uint32_t)right << 16);
+    wm->capture_frames++;
     return true;
 }
 
@@ -334,6 +320,13 @@ static void wm8904_audio_close(WM8904State *wm)
         audio_be_close_out(wm->audio_be, wm->voice);
         wm->voice = NULL;
     }
+}
+
+static void wm8904_exit(Notifier *notifier, void *data)
+{
+    WM8904State *wm = container_of(notifier, WM8904State, exit_notifier);
+
+    wm8904_audio_close(wm);
 }
 
 static int wm8904_audio_init(WM8904State *wm, Error **errp)
@@ -378,13 +371,15 @@ static void wm8904_reset(DeviceState *dev)
     wm->playback_frames = 0;
     wm->last_playback_word = 0;
 
-    /* Flush ring buffer and deactivate voice. */
+    /* Flush ring buffer and deactivate, but retain the realized host voice. */
     memset(wm->playback_ring, 0, sizeof(wm->playback_ring));
     wm->playback_write = 0;
     wm->playback_read = 0;
     wm->playback_count = 0;
-
-    wm8904_audio_close(wm);
+    if (wm->voice && wm->audio_be) {
+        audio_be_set_active_out(wm->audio_be, wm->voice, false);
+    }
+    wm->voice_active = false;
 
     /* Reset tone state. */
     wm->tone_idx = 0;
@@ -477,6 +472,12 @@ static void wm8904_realize(DeviceState *dev, Error **errp)
 {
     WM8904State *wm = WM8904(dev);
 
+    if (wm->capture_mode > WM8904_CAPTURE_SILENCE) {
+        error_setg(errp, "%s: invalid capture-mode %u", TYPE_WM8904,
+                   wm->capture_mode);
+        return;
+    }
+
     if (!audio_be_check(&wm->audio_be, errp)) {
         return;
     }
@@ -485,12 +486,20 @@ static void wm8904_realize(DeviceState *dev, Error **errp)
     if (wm8904_audio_init(wm, errp) != 0) {
         return;
     }
+
+    wm->exit_notifier.notify = wm8904_exit;
+    qemu_add_exit_notifier(&wm->exit_notifier);
+    wm->exit_notifier_registered = true;
 }
 
 static void wm8904_finalize(Object *obj)
 {
     WM8904State *wm = WM8904(obj);
 
+    if (wm->exit_notifier_registered) {
+        qemu_remove_exit_notifier(&wm->exit_notifier);
+        wm->exit_notifier_registered = false;
+    }
     wm8904_audio_close(wm);
     wm->audio_be = NULL;
 }

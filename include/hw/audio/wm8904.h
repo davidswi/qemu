@@ -9,6 +9,7 @@
 
 #include "hw/audio/rt685_audio_link.h"
 #include "hw/i2c/i2c.h"
+#include "qemu/audio.h"
 #include "qom/object.h"
 
 #define TYPE_WM8904 "wm8904"
@@ -16,11 +17,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(WM8904State, WM8904)
 
 #define WM8904_NUM_REGS 256
 
+/* Ring buffer: power-of-two capacity in int16_t samples.
+ * 4096 stereo frames × 2 channels = 8192 int16_t entries,
+ * ~85 ms at 48 kHz. */
+#define PLAYBACK_BUF_SIZE 8192
+/* Number of sine-table entries for capture tone (440 Hz, 48 kHz).
+ * Period ≈ 109 samples; round up to a power of two for clean wrapping. */
+#define TONE_TABLE_SIZE 256
+
 /* Registers referenced by the MCUXpresso WM8904 driver. */
 #define WM8904_RESET              0
 #define WM8904_WRT_SEQUENCER_0    46
 #define WM8904_WRT_SEQUENCER_3    49
 #define WM8904_WRT_SEQUENCER_4    50
+
+#define WM8904_CAPTURE_TONE      0
+#define WM8904_CAPTURE_RAMP      1
+#define WM8904_CAPTURE_SILENCE   2
 
 struct WM8904State {
     I2CSlave parent_obj;
@@ -35,6 +48,23 @@ struct WM8904State {
     uint64_t capture_frames;
     uint64_t playback_frames;
     uint32_t last_playback_word;
+
+    /* Host audio output (owned by this device, not migrated). */
+    AudioBackend *audio_be;
+    SWVoiceOut *voice;
+    int16_t playback_ring[PLAYBACK_BUF_SIZE];
+    unsigned playback_write;   /* next ring slot to fill          */
+    unsigned playback_read;    /* next ring slot to drain         */
+    uint32_t playback_count;   /* frames buffered (left+right)    */
+    uint64_t playback_dropped; /* frames dropped on overflow      */
+    uint64_t playback_underruns;
+    bool voice_active;
+
+    /* Deterministic capture tone.
+     * Stored as uint32 for property/migration compatibility.
+     * 0=tone, 1=ramp, 2=silence. */
+    uint32_t capture_mode;      /* raw integer value              */
+    unsigned tone_idx;         /* index into tone_table           */
 };
 
 #endif /* HW_AUDIO_WM8904_H */

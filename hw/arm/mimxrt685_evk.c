@@ -11,6 +11,7 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/imxrt685.h"
 #include "hw/core/boards.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/loader.h"
 #include "qemu/error-report.h"
@@ -64,6 +65,10 @@ static void mimxrt685_evk_init(MachineState *machine)
 
     object_initialize_child(OBJECT(machine), "soc", &s->soc,
                             TYPE_IMXRT685_SOC);
+    if (machine->audiodev) {
+        qdev_prop_set_string(DEVICE(&s->soc), "audiodev",
+                             machine->audiodev);
+    }
     qdev_prop_set_string(DEVICE(&s->soc), "cpu-type", machine->cpu_type);
     sysbus_realize(SYS_BUS_DEVICE(&s->soc), &error_fatal);
 
@@ -82,6 +87,7 @@ static void mimxrt685_evk_machine_class_init(ObjectClass *oc,
     };
 
     mc->desc = "NXP MIMXRT685-EVK (Cortex-M33, local experimental model)";
+    machine_add_audiodev_property(mc);
     mc->init = mimxrt685_evk_init;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     mc->valid_cpu_types = valid_cpu_types;

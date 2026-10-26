@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/audio.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "hw/arm/imxrt685.h"
@@ -253,6 +254,27 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
         Object *link = OBJECT(&s->audio_link);
 
         s->wm8904 = i2c_slave_new(TYPE_WM8904, 0x1a);
+        /*
+         * Forward audiodev to the codec.  Priority: explicit property >
+         * first named backend in the global queue (e.g. "rt685" from
+         * -audiodev wav,id=rt685,...).
+         */
+        if (s->audiodev) {
+            object_property_set_str(OBJECT(s->wm8904), "audiodev",
+                                    s->audiodev, &error_abort);
+        } else {
+            /*
+             * No explicit property: try to get the first available
+             * backend by name from the global audiodevs queue.
+             */
+            Error *local_err = NULL;
+            AudioBackend *be = audio_be_by_name("rt685", &local_err);
+
+            if (be) {
+                object_property_set_str(OBJECT(s->wm8904), "audiodev",
+                                        audio_be_get_id(be), &error_abort);
+            }
+        }
         object_property_set_link(link, "rx", OBJECT(&s->flexcomm[1]),
                                  &error_abort);
         object_property_set_link(link, "tx", OBJECT(&s->flexcomm[3]),
@@ -311,6 +333,7 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
 }
 
 static const Property imxrt685_properties[] = {
+    DEFINE_PROP_STRING("audiodev", IMXRT685State, audiodev),
     DEFINE_PROP_STRING("cpu-type", IMXRT685State, cpu_type),
 };
 

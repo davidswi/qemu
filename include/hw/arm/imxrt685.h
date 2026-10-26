@@ -61,6 +61,7 @@ struct IMXRT685State {
     Rt6xxFlexcommState flexcomm[10];
     Rt685AudioLink audio_link;
     I2CSlave *wm8904;           /* created during realize */
+    char *audiodev;             /* forwarded from machine */
     char *cpu_type;
 };
 

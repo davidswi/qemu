@@ -356,6 +356,7 @@ config IMXRT685_SOC
     select RT6XX_OSTIMER
     select RT6XX_RSTCTL
     select RT6XX_SYSCON
+    select IMXRT685_DMA
 
 config RASPI
     bool

@@ -17,6 +17,10 @@
 #include "qemu/module.h"
 #include "trace.h"
 
+/* I2S FIFO DMA request bits in FIFOCFG register. */
+#define I2S_FIFOCFG_TXDMA   BIT(12)
+#define I2S_FIFOCFG_RXDMA   BIT(13)
+
 #define RT6XX_FLEXCOMM_IOSIZE 0x1000
 
 #define CFG_ENABLE          BIT(0)
@@ -1030,10 +1034,7 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
         i->div = val & I2S_DIV_MASK;
         break;
     case 0xe00:
-        if (val & (BIT(12) | BIT(13))) {
-            qemu_log_mask(LOG_UNIMP, "%s: I2S DMA requests are not "
-                          "implemented\n", TYPE_RT6XX_FLEXCOMM);
-        }
+        /* BIT(12)=TXDMA, BIT(13)=RXDMA are handled by the eDMA model. */
         if (val & I2S_FIFOCFG_PACK48) {
             qemu_log_mask(LOG_UNIMP, "%s: I2S 48-bit packing is not "
                           "implemented\n", TYPE_RT6XX_FLEXCOMM);
@@ -1102,6 +1103,9 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
     }
 }
 
+/* Forward declaration for rt6xx_flexcomm_i2s_on_sample_consumed. */
+static void rt6xx_flexcomm_i2s_on_sample_consumed(Rt6xxFlexcommState *s);
+
 /*
  * Board audio endpoint.  The link only calls these while the
  * corresponding direction reports itself active.
@@ -1149,6 +1153,11 @@ static bool rt6xx_flexcomm_endpoint_pop(Rt685AudioEndpoint *ep,
     i->tx_head = (i->tx_head + 1) % RT6XX_FLEXCOMM_I2S_FIFO_SIZE;
     i->tx_count--;
     rt6xx_flexcomm_update_irq(s);
+
+    /* Notify eDMA that a sample was consumed — may trigger DREQ. */
+    if (i->fifocfg & I2S_FIFOCFG_TXDMA) {
+        rt6xx_flexcomm_i2s_on_sample_consumed(s);
+    }
     return true;
 }
 
@@ -1159,6 +1168,76 @@ static bool rt6xx_flexcomm_endpoint_is_active(Rt685AudioEndpoint *ep,
 
     return dir == RT685_AUDIO_DIR_RX ? rt6xx_flexcomm_i2s_rx_active(s) :
                                        rt6xx_flexcomm_i2s_tx_active(s);
+}
+
+/*
+ * Push a sample into the Flexcomm I2S TX FIFO.  Called by the eDMA model
+ * when DOFF==0 (fixed destination write to FIFO).
+ */
+bool rt6xx_flexcomm_i2s_fifo_push(Rt6xxFlexcommState *s, uint32_t sample)
+{
+    Rt6xxFlexcommI2sState *i = &s->i2s;
+
+    if (rt6xx_flexcomm_selected(s) != RT6XX_FLEXCOMM_PERIPH_I2S_TX) {
+        return false;
+    }
+    if (!rt6xx_flexcomm_i2s_tx_active(s)) {
+        return false;
+    }
+    if (i->tx_count == RT6XX_FLEXCOMM_I2S_FIFO_SIZE) {
+        i->fifoerr |= I2S_FIFOSTAT_TXERR;   /* TX overflow */
+        rt6xx_flexcomm_update_irq(s);
+        return false;
+    }
+    unsigned tail = (i->tx_head + i->tx_count) % RT6XX_FLEXCOMM_I2S_FIFO_SIZE;
+
+    i->tx_fifo[tail] = sample;
+    i->tx_count++;
+    trace_rt6xx_flexcomm_i2s_dma_push(DEVICE(s)->canonical_path, sample);
+    rt6xx_flexcomm_update_irq(s);
+
+    /* Check if we should deassert DREQ (FIFO now above watermark). */
+    unsigned tx_trigger = extract32(i->fifotrig, 8, 4);
+    bool dreq_active = i->tx_count > tx_trigger;
+    bool old_dreq = s->i2s.dreq_asserted;
+
+    if (dreq_active != old_dreq) {
+        s->i2s.dreq_asserted = dreq_active;
+        if (s->i2s.dreq_assert && s->i2s.dreq_opaque) {
+            s->i2s.dreq_assert(s->i2s.dreq_opaque, dreq_active ? 1 : 0);
+        }
+    }
+    return true;
+}
+
+/*
+ * Called by the audio-link when a sample is popped from the TX FIFO for
+ * playback.  Triggers DREQ to eDMA if the FIFO now falls below watermark.
+ */
+static void rt6xx_flexcomm_i2s_on_sample_consumed(Rt6xxFlexcommState *s)
+{
+    Rt6xxFlexcommI2sState *i = &s->i2s;
+
+    /* Only TX direction with DMA enabled generates DREQ. */
+    if (!(rt6xx_flexcomm_i2s_tx_active(s))) {
+        return;
+    }
+    if (!(i->fifocfg & I2S_FIFOCFG_TXDMA)) {
+        return;
+    }
+
+    unsigned tx_trigger = extract32(i->fifotrig, 8, 4);
+    bool dreq_active = i->tx_count > tx_trigger;
+    bool old_dreq = s->i2s.dreq_asserted;
+
+    if (dreq_active != old_dreq) {
+        s->i2s.dreq_asserted = dreq_active;
+        trace_rt6xx_flexcomm_i2s_dreq(DEVICE(s)->canonical_path,
+                                      dreq_active);
+        if (s->i2s.dreq_assert && s->i2s.dreq_opaque) {
+            s->i2s.dreq_assert(s->i2s.dreq_opaque, dreq_active ? 1 : 0);
+        }
+    }
 }
 
 static void rt6xx_flexcomm_i2s_reset_state(Rt6xxFlexcommState *s)
@@ -1179,6 +1258,7 @@ static void rt6xx_flexcomm_i2s_reset_state(Rt6xxFlexcommState *s)
     i->tx_count = 0;
     i->rx_head = 0;
     i->rx_count = 0;
+    s->i2s.dreq_asserted = false;
     rt6xx_flexcomm_i2s_link_update(s);
 }
 

@@ -147,6 +147,8 @@ rt6xx_flexcomm_i2c_byte(const char *path, bool recv, uint8_t value, bool ack) "%
 rt6xx_flexcomm_i2c_stop(const char *path, unsigned state) "%s I2C STOP state %u"
 rt6xx_flexcomm_spi_cs(const char *path, uint8_t old, uint8_t new) "%s SPI SSEL 0x%x -> 0x%x"
 rt6xx_flexcomm_spi_frame(const char *path, uint32_t tx, uint32_t rx, unsigned bits, uint8_t ssel, bool eot, bool eof, bool loop) "%s SPI frame tx 0x%04x rx 0x%04x bits %u SSEL 0x%x EOT %d EOF %d loop %d"
+rt6xx_flexcomm_i2s_dreq(const char *path, bool active) "%s I2S DREQ %d"
+rt6xx_flexcomm_i2s_dma_push(const char *path, uint32_t sample) "%s I2S DMA push 0x%08x"
 
 # riscv_htif.c
 htif_uart_write_to_host(uint8_t device, uint8_t cmd, uint64_t payload) "device: %u cmd: %02u payload: %016" PRIx64

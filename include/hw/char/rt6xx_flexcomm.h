@@ -9,6 +9,7 @@
 
 #include "chardev/char-fe.h"
 #include "hw/audio/rt685_audio_link.h"
+#include "hw/core/qdev.h"
 #include "hw/core/sysbus.h"
 #include "hw/i2c/i2c.h"
 #include "hw/ssi/ssi.h"
@@ -128,6 +129,11 @@ typedef struct Rt6xxFlexcommI2sState {
     uint8_t tx_count;
     uint8_t rx_head;
     uint8_t rx_count;
+
+    /* DMA integration: DREQ callback to eDMA controller. */
+    void *dreq_opaque;      /* opaque pointer for the callback    */
+    void (*dreq_assert)(void *opaque, int level);  /* DREQ signal        */
+    bool dreq_asserted;     /* cached DREQ assertion state         */
 } Rt6xxFlexcommI2sState;
 
 typedef struct Rt6xxFlexcommUsartState {
@@ -169,5 +175,11 @@ struct Rt6xxFlexcommState {
     /* EVK board audio link (only wired for the EVK I2S instances). */
     Rt685AudioLink *audio_link;
 };
+
+/*
+ * Push a 32-bit sample into the Flexcomm I2S TX FIFO.  Called by the eDMA
+ * model when DOFF==0 (fixed destination, i.e., writing directly to FIFO).
+ */
+bool rt6xx_flexcomm_i2s_fifo_push(Rt6xxFlexcommState *s, uint32_t sample);
 
 #endif

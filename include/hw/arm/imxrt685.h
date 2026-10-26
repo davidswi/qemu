@@ -13,6 +13,7 @@
 #include "hw/audio/rt685_audio_link.h"
 #include "hw/audio/wm8904.h"
 #include "hw/char/rt6xx_flexcomm.h"
+#include "hw/dma/imxrt685_dma.h"
 #include "hw/gpio/rt6xx_gpio.h"
 #include "hw/gpio/rt6xx_iopctl.h"
 #include "hw/misc/rt6xx_rstctl.h"
@@ -43,6 +44,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMXRT685State, IMXRT685_SOC)
 #define IMXRT685_SYSCTL1_BASE   0x40022000ULL
 #define IMXRT685_GPIO_BASE      0x40100000ULL
 #define IMXRT685_OSTIMER_BASE   0x40113000ULL
+/*
+ * eDMA controller base address (one contiguous region for both channels).
+ * The SDK uses channel 0 for TX and channel 1 for RX.
+ */
+#define IMXRT685_DMA0_BASE      0x40104000ULL
 
 struct IMXRT685State {
     SysBusDevice parent_obj;
@@ -59,6 +65,7 @@ struct IMXRT685State {
     Rt6xxGpioState gpio;
     Rt6xxOSTimerState ostimer;
     Rt6xxFlexcommState flexcomm[10];
+    Imxrt685DmaState dma;       /* NXP DMA controller for I2S DMA    */
     Rt685AudioLink audio_link;
     I2CSlave *wm8904;           /* created during realize */
     char *audiodev;             /* forwarded from machine */

@@ -18,6 +18,11 @@
 #define CLKCTL1 0x40021000
 #define SYSCTL1 0x40022000
 #define GPIO    0x40100000
+#define DMA0    0x40104000
+/* Per-channel register offsets. */
+#define CHN_CFG       0x00
+#define CHN_CTLSTAT   0x04
+#define CHN_XFERCFG   0x08
 #define OSTIMER 0x40113000
 #define FC0     0x40106000
 #define FC3     0x40109000
@@ -28,6 +33,17 @@
 #define FC_PSELID_PRESENT_SPI 0x00101020
 #define FC_PSELID_PRESENT_I2C 0x00101040
 #define FC14_PATH "/machine/soc/flexcomm14"
+
+static QTestState *mimxrt685_qtest_init(const char *args)
+{
+    g_autofree char *full_args =
+        g_strdup_printf("-audiodev none,id=rt685 %s", args);
+
+    return qtest_init(full_args);
+}
+
+/* Every test instantiates the board codec, so always provide a null backend. */
+#define qtest_init(args) mimxrt685_qtest_init(args)
 
 static uint64_t gray_to_binary(uint64_t gray)
 {
@@ -722,6 +738,249 @@ static void test_flexcomm_i2s_tx_level_irq(void)
     qtest_quit(s);
 }
 
+/* ----------------------------------------------------------------------- */
+/* DMA0 register model tests                                               */
+/* ----------------------------------------------------------------------- */
+
+static void test_dma_reset_values(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    /* CTRL, INTSTAT, SRAMBASE all read zero after reset. */
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x000), ==, 0);
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x004), ==, 0);
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x008), ==, 0);
+
+    /* Channel registers also zero. */
+    for (int ch = 0; ch < 32; ch++) {
+        uint64_t base = DMA0 + 0x400 + ch * 0x10;
+        g_assert_cmphex(qtest_readl(s, base + 0x0), ==, 0); /* CFG */
+        g_assert_cmphex(qtest_readl(s, base + 0x4), ==, 0); /* CTLSTAT */
+        g_assert_cmphex(qtest_readl(s, base + 0x8), ==, 0); /* XFERCFG */
+    }
+
+    qtest_quit(s);
+}
+
+static void test_dma_enable_set_clear(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    /* ENABLESET is W1S — writing a bit sets it. */
+    qtest_writel(s, DMA0 + 0x20, BIT(7) | BIT(2));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x20), ==, (BIT(7) | BIT(2)));
+
+    /* ENABLECLR is W1C — writing clears bits. */
+    qtest_writel(s, DMA0 + 0x28, BIT(2));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x20), ==, BIT(7));
+
+    /* Writing to ENABLESET after SETTRIG should work independently. */
+    qtest_writel(s, DMA0 + 0x70, BIT(7)); /* Set trigger on ch7. */
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x20), ==, (BIT(7)));
+
+    /* ENABLECLR on a channel that wasn't set has no effect. */
+    qtest_writel(s, DMA0 + 0x28, BIT(5));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x20), ==, (BIT(7)));
+
+    /* Clear the remaining bit and verify. */
+    qtest_writel(s, DMA0 + 0x28, BIT(7));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x20), ==, 0);
+
+    qtest_quit(s);
+}
+
+static void test_dma_interrupt_enables(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+
+    /* INTENSET is W1S. */
+    qtest_writel(s, DMA0 + 0x48, BIT(0) | BIT(1));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x48), ==, (BIT(0) | BIT(1)));
+
+    /* INTENCLR is W1C. */
+    qtest_writel(s, DMA0 + 0x50, BIT(0));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x48), ==, BIT(1));
+
+    /*
+     * INTA/INTB are W1C: writing a 1 to a bit position clears that flag.
+     */
+    qtest_writel(s, DMA0 + 0x58, BIT(7) | BIT(2));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x58), ==, 0); /* cleared by write */
+
+    /* ERRINT is also W1C — write clears flags. */
+    qtest_writel(s, DMA0 + 0x40, BIT(3));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x40), ==, 0);
+
+    /* Writing INTSTAT clears ACTIVEINT/ACTIVEERRINT summaries. */
+    qtest_writel(s, DMA0 + 0x04, BIT(0)); /* Write to clear. */
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x04), ==, 0);
+
+    qtest_quit(s);
+}
+
+static void test_dma_srambase_alignment(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    /* SRAMBASE masks off lower 9 bits (512-byte alignment). */
+    uint32_t val = 0x200003FF;
+    qtest_writel(s, DMA0 + 0x008, val);
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x008), ==, (val & ~0x1FF));
+
+    /* Writing an already-aligned address preserves it. */
+    qtest_writel(s, DMA0 + 0x008, 0x20000200);
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x008), ==, 0x20000200);
+
+    qtest_quit(s);
+}
+
+static void test_dma_channel_cfg_and_xfercfg(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+    unsigned ch = 7;
+    uint64_t base = DMA0 + 0x400 + ch * 0x10;
+
+    /* Write CFG — PERIPHREQEN plus channel priority 3. */
+    qtest_writel(s, base + CHN_CFG, BIT(0) | (3U << 16));
+    g_assert_cmphex(qtest_readl(s, base + CHN_CFG), ==,
+                    (BIT(0) | (3U << 16)));
+
+    /* Two 32-bit transfers: increment source, hold destination constant. */
+    uint32_t xfer = BIT(0);     /* CFGVALID */
+    xfer |= (2U << 8);          /* width = 4 bytes */
+    xfer |= (1U << 12);         /* srcInc = 1 */
+    xfer |= (1U << 16);         /* count-minus-one = 1 */
+    qtest_writel(s, base + CHN_XFERCFG, xfer);
+    g_assert_cmphex(qtest_readl(s, base + CHN_XFERCFG), ==, xfer);
+
+    /* SETTRIG sets the TRIG latch in CTLSTAT. */
+    qtest_writel(s, DMA0 + 0x70, BIT(ch));
+    uint32_t ctlstat = qtest_readl(s, base + CHN_CTLSTAT);
+    g_assert_cmphex(ctlstat & BIT(2), ==, BIT(2)); /* TRIG set */
+
+    /* CTLSTAT is read-only. */
+    qtest_writel(s, base + CHN_CTLSTAT, 0);
+    ctlstat = qtest_readl(s, base + CHN_CTLSTAT);
+    g_assert_cmphex(ctlstat & BIT(2), ==, BIT(2));
+
+    /* SETVALID sets VALIDPENDING. */
+    qtest_writel(s, DMA0 + 0x68, BIT(ch));
+    ctlstat = qtest_readl(s, base + CHN_CTLSTAT);
+    g_assert_cmphex(ctlstat & BIT(0), ==, BIT(0)); /* VALIDPENDING */
+
+    qtest_quit(s);
+}
+
+static void test_dma_descriptor_transfer(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+    const uint32_t desc = 0x20000000;
+    const uint32_t src = 0x20000400;
+    const uint32_t dst = 0x20000500;
+    const uint32_t xfer = BIT(0) | BIT(4) | (2U << 8) |
+                          (1U << 12) | (1U << 14) | (1U << 16);
+
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+
+    qtest_writel(s, src, 0x11223344);
+    qtest_writel(s, src + 4, 0xaabbccdd);
+
+    /* Channel 0 head descriptor; descriptors contain end addresses. */
+    qtest_writel(s, desc, xfer);
+    qtest_writel(s, desc + 4, src + 4);
+    qtest_writel(s, desc + 8, dst + 4);
+    qtest_writel(s, desc + 12, 0);
+
+    qtest_writel(s, DMA0 + 0x008, desc);
+    qtest_writel(s, DMA0 + 0x000, BIT(0));
+    qtest_writel(s, DMA0 + 0x020, BIT(0));
+    qtest_writel(s, DMA0 + 0x400 + CHN_XFERCFG, xfer);
+    qtest_writel(s, DMA0 + 0x048, BIT(0));
+    qtest_writel(s, DMA0 + 0x400 + CHN_XFERCFG, xfer | BIT(2));
+
+    g_assert_cmphex(qtest_readl(s, dst), ==, 0x11223344);
+    g_assert_cmphex(qtest_readl(s, dst + 4), ==, 0xaabbccdd);
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x058), ==, BIT(0));
+    g_assert_true(qtest_get_irq(s, 1));
+
+    qtest_writel(s, DMA0 + 0x058, BIT(0));
+    g_assert_false(qtest_get_irq(s, 1));
+
+    qtest_quit(s);
+}
+
+static void test_dma_ctrl_enable(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+
+    /* CTRL bit 0 enables DMA. */
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x000), ==, 0);
+    qtest_writel(s, DMA0 + 0x000, BIT(0));
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x000), ==, BIT(0));
+
+    /* Writing non-enable bits has no effect. */
+    qtest_writel(s, DMA0 + 0x000, 0xff);
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x000), ==, BIT(0));
+
+    /* Write zero to disable. */
+    qtest_writel(s, DMA0 + 0x000, 0);
+    g_assert_cmphex(qtest_readl(s, DMA0 + 0x000), ==, 0);
+
+    qtest_quit(s);
+}
+
+static void test_dma_irq_derivation(void)
+{
+    QTestState *s = qtest_init("-machine mimxrt685-evk");
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+
+    /* Initially IRQ should be low. */
+    g_assert_false(qtest_get_irq(s, 1));
+
+    /*
+     * INTA/INTB are W1C registers: writing a 1 clears the pending flag.
+     * The SDK never writes to INTA/INTB to SET flags; instead it sets up
+     * channel descriptors and enables them, which causes the DMA engine to
+     * set these flags internally when descriptors complete.
+     */
+
+    /*
+     * Enable interrupt for channel 2 in INTENSET (but no pending flag yet).
+     * IRQ should be low since no channels have triggered.
+     */
+    qtest_writel(s, DMA0 + 0x48, BIT(2));
+    g_assert_false(qtest_get_irq(s, 1)); /* No pending flags set. */
+
+    /*
+     * Write to INTA/INTB should clear (not set) the corresponding bits.
+     * Since no flags are set yet, writing has no effect on IRQ state.
+     */
+    qtest_writel(s, DMA0 + 0x58, BIT(2)); /* Clear ch2 INTA (no-op). */
+    g_assert_false(qtest_get_irq(s, 1));
+
+    /* Clear INTEN — write to INTENCLR should work even if nothing is set. */
+    qtest_writel(s, DMA0 + 0x50, BIT(2));
+
+    /* Set interrupt enables for channels 3 and 7 (but no pending yet). */
+    qtest_writel(s, DMA0 + 0x48, BIT(3) | BIT(7));
+    g_assert_false(qtest_get_irq(s, 1)); /* No flags set. */
+
+    /* Clear them — IRQ should stay low. */
+    qtest_writel(s, DMA0 + 0x50, BIT(3) | BIT(7));
+    g_assert_false(qtest_get_irq(s, 1));
+
+    /* ERRINT should also work as W1C. Enable error interrupt. */
+    qtest_writel(s, DMA0 + 0x48, BIT(0)); /* Enable global err int. */
+    g_assert_false(qtest_get_irq(s, 1)); /* No errors yet. */
+
+    /* Clear ERRINT — write to clear (no-op since nothing set). */
+    qtest_writel(s, DMA0 + 0x40, BIT(5));
+    g_assert_false(qtest_get_irq(s, 1));
+
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -751,5 +1010,21 @@ int main(int argc, char **argv)
                    test_flexcomm_spi_slave_miso);
     qtest_add_func("/mimxrt685/flexcomm-i2s-tx-level-irq",
                    test_flexcomm_i2s_tx_level_irq);
+
+    /* DMA0 register model tests. */
+    qtest_add_func("/mimxrt685/dma-reset-values", test_dma_reset_values);
+    qtest_add_func("/mimxrt685/dma-enable-set-clear",
+                   test_dma_enable_set_clear);
+    qtest_add_func("/mimxrt685/dma-interrupt-enables",
+                   test_dma_interrupt_enables);
+    qtest_add_func("/mimxrt685/dma-srambase-alignment",
+                   test_dma_srambase_alignment);
+    qtest_add_func("/mimxrt685/dma-channel-cfg-xfercfg",
+                   test_dma_channel_cfg_and_xfercfg);
+    qtest_add_func("/mimxrt685/dma-descriptor-transfer",
+                   test_dma_descriptor_transfer);
+    qtest_add_func("/mimxrt685/dma-ctrl-enable", test_dma_ctrl_enable);
+    qtest_add_func("/mimxrt685/dma-irq-derivation", test_dma_irq_derivation);
+
     return g_test_run();
 }

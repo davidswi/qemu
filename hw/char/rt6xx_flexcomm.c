@@ -948,6 +948,8 @@ static uint32_t rt6xx_flexcomm_i2s_fifostat(Rt6xxFlexcommState *s)
     return value;
 }
 
+static void rt6xx_flexcomm_i2s_update_dreq(Rt6xxFlexcommState *s);
+
 static uint64_t rt6xx_flexcomm_i2s_read(Rt6xxFlexcommState *s, hwaddr offset)
 {
     Rt6xxFlexcommI2sState *i = &s->i2s;
@@ -994,6 +996,7 @@ static uint64_t rt6xx_flexcomm_i2s_read(Rt6xxFlexcommState *s, hwaddr offset)
             i->rx_head = (i->rx_head + 1) % RT6XX_FLEXCOMM_I2S_FIFO_SIZE;
             i->rx_count--;
             rt6xx_flexcomm_update_irq(s);
+            rt6xx_flexcomm_i2s_update_dreq(s);
         }
         return value;
     }
@@ -1010,8 +1013,7 @@ static uint64_t rt6xx_flexcomm_i2s_read(Rt6xxFlexcommState *s, hwaddr offset)
         }
         return 0;
     }
-}/* fwd */
-static void rt6xx_flexcomm_i2s_update_dreq(Rt6xxFlexcommState *s);
+}
 
 static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
                                      uint32_t val)
@@ -1191,6 +1193,7 @@ static bool rt6xx_flexcomm_endpoint_push(Rt685AudioEndpoint *ep,
         word;
     i->rx_count++;
     rt6xx_flexcomm_update_irq(s);
+    rt6xx_flexcomm_i2s_update_dreq(s);
     return true;
 }
 

@@ -38,6 +38,7 @@
 
 #include "hw/core/qdev.h"
 #include "hw/core/sysbus.h"
+#include "qemu/main-loop.h"
 
 /* Non-secure base address used by the SDK firmware. */
 #define IMXRT685_DMA0_BASE_NS  0x40104000ULL
@@ -48,29 +49,29 @@
 /* CTRL bits. */
 #define DMA_CTRL_ENABLE        BIT(0)
 
-/* Per-channel CFG bits (compact storage). */
+/* Per-channel CFG bits. */
 #define DMA_CFG_PERIPHREQEN    BIT(0)   /* accept peripheral DREQ       */
 #define DMA_CFG_HWTRIGEN       BIT(1)   /* hardware trigger input active*/
-#define DMA_CFG_PRIORITY(n)      ((n) & 7)   /* priority field (bits 3:5 in real HW,
-                                                  stored compactly here; 0=high)*/
-#define DMA_CFG_NCOINCR        BIT(6)   /* source increment disable       */
-#define DMA_CFG_DOINCRRR       BIT(7)   /* destination increment disable  */
+#define DMA_CFG_PRIORITY(n)    (((n) & 7) << 16) /* 0 = highest priority */
 
 /* Channel CTLSTAT bits. */
-#define DMA_CTLSTAT_TRIG       BIT(0)   /* trigger latch (set by SWTRIG/SETTRIG) */
-#define DMA_CTLSTAT_VALIDPENDING BIT(2) /* valid-pending flag               */
-#define DMA_CTLSTAT_BUSY       BIT(5)   /* channel is busy                  */
+#define DMA_CTLSTAT_VALIDPENDING BIT(0) /* valid-pending flag               */
+#define DMA_CTLSTAT_TRIG       BIT(2)   /* trigger latch */
 
 /* XFERCFG control bit masks (bits 0:5). */
-#define DMA_XFER_CLRTRIG       BIT(0)   /* clear trigger on completion      */
-#define DMA_XFER_INTA          BIT(1)   /* interrupt A on complete          */
-#define DMA_XFER_INTB          BIT(2)   /* interrupt B on complete          */
+#define DMA_XFER_CFGVALID      BIT(0)   /* descriptor is valid              */
+#define DMA_XFER_RELOAD        BIT(1)   /* load linked descriptor           */
+#define DMA_XFER_SWTRIG        BIT(2)   /* set trigger on register write    */
+#define DMA_XFER_CLRTRIG       BIT(3)   /* clear trigger on completion      */
+#define DMA_XFER_INTA          BIT(4)   /* interrupt A on complete          */
+#define DMA_XFER_INTB          BIT(5)   /* interrupt B on complete          */
+#define DMA_XFER_VALID_MASK    0x03fff33fU
 
 /* XFERCFG field positions. */
 #define DMA_XFER_WIDTH(n)        extract32((n), 8, 2)   /* width 9:8    */
-#define DMA_XFER_SRCINC(n)       extract32((n), 12, 4)  /* src inc 15:12*/
-#define DMA_XFER_DSTINC(n)       extract32((n), 16, 4)  /* dst inc 19:16*/
-#define DMA_XFER_COUNT(n)        ((n) >> 10)            /* count 25:10  */
+#define DMA_XFER_SRCINC(n)       extract32((n), 12, 2)  /* src inc 13:12*/
+#define DMA_XFER_DSTINC(n)       extract32((n), 14, 2)  /* dst inc 15:14*/
+#define DMA_XFER_COUNT(n)        extract32((n), 16, 10) /* count 25:16  */
 
 /* Width multiplier. */
 static inline unsigned dma_width_bytes(unsigned width)
@@ -100,6 +101,7 @@ typedef struct Imxrt685DmaChn {
     unsigned remaining;
 
     bool dreq_level;
+    bool enabled;
     bool valid_pending;
     bool active;
     bool busy;
@@ -127,6 +129,7 @@ struct Imxrt685DmaState {
 
     /* Deferred DMA service flag (re-entrancy guard). */
     bool service_pending;
+    QEMUBH *service_bh;
 };
 
 #endif /* HW_DMA_IMXRT685_DMA_H */

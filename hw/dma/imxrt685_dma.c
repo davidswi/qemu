@@ -63,7 +63,15 @@
 #define MAX_BEATS_PER_PASS 256
 
 /* Forward declaration for deferred service callback. */
-static void dma_service_bh(Imxrt685DmaState *s);
+static void dma_service_bh(void *opaque);
+
+static void dma_schedule(Imxrt685DmaState *s)
+{
+    if (!s->service_pending) {
+        s->service_pending = true;
+        qemu_bh_schedule(s->service_bh);
+    }
+}
 
 /* ----------------------------------------------------------------------- */
 /* IRQ derivation                                                          */
@@ -91,7 +99,7 @@ static void imxrt685_dma_update_irq(Imxrt685DmaState *s)
 static bool dma_fetch_descriptor(Imxrt685DmaState *s, hwaddr addr,
                                  DMADescriptor *desc)
 {
-    AddressSpace *as = get_system_memory();
+    AddressSpace *as = &address_space_memory;
 
     if (address_space_rw(as, addr, MEMTXATTRS_UNSPECIFIED,
                          (uint8_t *)desc, sizeof(*desc), false) != MEMTX_OK) {
@@ -138,6 +146,10 @@ static void dma_load_channel_from_desc(Imxrt685DmaState *s, unsigned chn,
     unsigned src_inc = DMA_XFER_SRCINC(desc->xfercfg);
     unsigned dst_inc = DMA_XFER_DSTINC(desc->xfercfg);
 
+    /* The encoding 3 means four times the transfer width. */
+    src_inc = src_inc == 3 ? 4 : src_inc;
+    dst_inc = dst_inc == 3 ? 4 : dst_inc;
+
     /* NXP descriptors store END addresses, not start. */
     c->current_src = desc->src_end - (c->remaining - 1) * width_bytes * src_inc;
     c->current_dst = desc->dst_end - (c->remaining - 1) * width_bytes * dst_inc;
@@ -152,15 +164,21 @@ static void dma_load_head_descriptor(Imxrt685DmaState *s, unsigned chn)
     hwaddr desc_addr;
     DMADescriptor desc;
 
-    if (!s->srambase || !(s->ctrl & DMA_CTRL_ENABLE)) {
+    if (!s->srambase || !(s->ctrl & DMA_CTRL_ENABLE) || !c->enabled) {
         return;
     }
 
     desc_addr = s->srambase + chn * 16;
 
     if (dma_fetch_descriptor(s, desc_addr, &desc)) {
+        if (!(desc.xfercfg & DMA_XFER_CFGVALID)) {
+            c->valid_pending = false;
+            c->busy = false;
+            return;
+        }
         dma_load_channel_from_desc(s, chn, &desc);
         c->next_desc = desc.link;
+        c->valid_pending = true;
         c->active = false;
         c->busy = true;
     } else {
@@ -180,7 +198,7 @@ static bool dma_do_beat(Imxrt685DmaState *s, unsigned chn)
 {
     Imxrt685DmaChn *c = &s->chn[chn];
     uint32_t data = 0;
-    AddressSpace *as = get_system_memory();
+    AddressSpace *as = &address_space_memory;
 
     /* Decode width and increments from the live XFERCFG. */
     unsigned width = DMA_XFER_WIDTH(c->xfercfg);
@@ -192,12 +210,15 @@ static bool dma_do_beat(Imxrt685DmaState *s, unsigned chn)
 
     unsigned src_inc = DMA_XFER_SRCINC(c->xfercfg);
     unsigned dst_inc = DMA_XFER_DSTINC(c->xfercfg);
+
+    src_inc = src_inc == 3 ? 4 : src_inc;
+    dst_inc = dst_inc == 3 ? 4 : dst_inc;
     hwaddr old_src = c->current_src;
     hwaddr old_dst = c->current_dst;
 
     /* Read from source. */
     if (address_space_rw(as, c->current_src, MEMTXATTRS_UNSPECIFIED,
-                         (uint8_t *)&data, bytes, true) != MEMTX_OK) {
+                         (uint8_t *)&data, bytes, false) != MEMTX_OK) {
         trace_dma_error_bus_fault(chn, "read src", c->current_src);
         s->errint |= BIT(chn);
         return false;
@@ -212,7 +233,7 @@ static bool dma_do_beat(Imxrt685DmaState *s, unsigned chn)
 
     /* Write to destination. */
     if (address_space_rw(as, c->current_dst, MEMTXATTRS_UNSPECIFIED,
-                         (uint8_t *)&data, bytes, false) != MEMTX_OK) {
+                         (uint8_t *)&data, bytes, true) != MEMTX_OK) {
         trace_dma_error_bus_fault(chn, "write dst", c->current_dst);
         s->errint |= BIT(chn);
         return false;
@@ -262,7 +283,7 @@ static void dma_channel_complete(Imxrt685DmaState *s, unsigned chn)
     trace_dma_descriptor_complete(chn, s->inta, s->intb);
 
     /* Check for reload. */
-    if ((c->xfercfg & BIT(5)) && c->next_desc && !reload) {
+    if ((c->xfercfg & DMA_XFER_RELOAD) && c->next_desc) {
         DMADescriptor desc;
 
         if (dma_fetch_descriptor(s, c->next_desc, &desc)) {
@@ -287,9 +308,10 @@ static void dma_channel_complete(Imxrt685DmaState *s, unsigned chn)
 /* Deferred service                                                        */
 /* ----------------------------------------------------------------------- */
 
-static void dma_service_bh(Imxrt685DmaState *s)
+static void dma_service_bh(void *opaque)
 {
-    unsigned pri, chn_pri, best_chn = 0;
+    Imxrt685DmaState *s = opaque;
+    unsigned pri = UINT_MAX, chn_pri, best_chn = DMA_CHANNEL_COUNT;
     int i;
 
     s->service_pending = false;
@@ -298,16 +320,20 @@ static void dma_service_bh(Imxrt685DmaState *s)
     for (i = 0; i < DMA_CHANNEL_COUNT; i++) {
         Imxrt685DmaChn *c = &s->chn[i];
 
-        if (!c->valid_pending || !c->dreq_level) {
+        if (!c->enabled || !c->valid_pending ||
+            !(c->ctlstat & DMA_CTLSTAT_TRIG)) {
+            continue;
+        }
+        if ((c->cfg & DMA_CFG_PERIPHREQEN) && !c->dreq_level) {
             continue;
         }
         if (!(s->ctrl & DMA_CTRL_ENABLE)) {
             break;
         }
 
-        chn_pri = (c->cfg >> 3) & 7;  /* priority bits */
+        chn_pri = (c->cfg >> 16) & 7;
 
-        if (!best_chn || chn_pri < pri) {
+        if (best_chn == DMA_CHANNEL_COUNT || chn_pri < pri) {
             best_chn = i;
             pri = chn_pri;
         } else if (chn_pri == pri && i < best_chn) {
@@ -315,7 +341,7 @@ static void dma_service_bh(Imxrt685DmaState *s)
         }
     }
 
-    if (best_chn) {
+    if (best_chn != DMA_CHANNEL_COUNT) {
         Imxrt685DmaChn *c = &s->chn[best_chn];
         unsigned beats = 0;
 
@@ -329,7 +355,7 @@ static void dma_service_bh(Imxrt685DmaState *s)
 
             c->active = true;
             c->busy = true;
-            c->ctlstat |= DMA_CTLSTAT_TRIG;  /* clear trigger on active */
+            c->ctlstat |= DMA_CTLSTAT_TRIG;
 
             if (!dma_do_beat(s, best_chn)) {
                 /* Beat failed — channel is faulted. */
@@ -354,6 +380,10 @@ static void dma_service_bh(Imxrt685DmaState *s)
 
         if (!c->busy || beats == MAX_BEATS_PER_PASS) {
             c->active = false;
+        }
+
+        if (beats == MAX_BEATS_PER_PASS && c->remaining > 0) {
+            dma_schedule(s);
         }
 
         imxrt685_dma_update_irq(s);
@@ -391,7 +421,7 @@ static uint64_t dma_read(void *opaque, hwaddr offset, unsigned size)
         /* Read as CTRL mask for enabled channels. */
         val = 0;
         for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
-            if (s->chn[i].valid_pending) {
+            if (s->chn[i].enabled) {
                 val |= BIT(i);
             }
         }
@@ -505,23 +535,11 @@ static void dma_write(void *opaque, hwaddr offset, uint64_t value, unsigned size
         uint32_t mask = value & 0x1FFFFFFFL;
         for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
             if (mask & BIT(i)) {
-                s->chn[i].valid_pending = true;
+                s->chn[i].enabled = true;
                 trace_dma_enable_set(i);
 
-                /* If head descriptor hasn't been loaded, load it now. */
-                Imxrt685DmaChn *c = &s->chn[i];
-                if (!c->busy && !c->next_desc) {
-                    dma_load_head_descriptor(s, i);
-                } else if (c->busy && c->remaining == 0) {
-                    /* Descriptor completed but needs reload from SDK. */
-                    dma_channel_complete(s, i);
-                }
-
                 /* Schedule deferred service if not already pending. */
-                if (!s->service_pending) {
-                    s->service_pending = true;
-                    dma_service_bh(s);
-                }
+                dma_schedule(s);
             }
         }
         break;
@@ -533,7 +551,7 @@ static void dma_write(void *opaque, hwaddr offset, uint64_t value, unsigned size
             if (mask & BIT(i)) {
                 Imxrt685DmaChn *c = &s->chn[i];
 
-                c->valid_pending = false;
+                c->enabled = false;
                 c->ctlstat &= ~DMA_CTLSTAT_TRIG;
                 trace_dma_enable_clear(i);
 
@@ -601,10 +619,7 @@ static void dma_write(void *opaque, hwaddr offset, uint64_t value, unsigned size
                 }
 
                 /* Schedule deferred service if not already pending. */
-                if (!s->service_pending) {
-                    s->service_pending = true;
-                    dma_service_bh(s);
-                }
+                dma_schedule(s);
             }
         }
         break;
@@ -618,9 +633,8 @@ static void dma_write(void *opaque, hwaddr offset, uint64_t value, unsigned size
                 trace_dma_settrig(i);
 
                 /* Schedule deferred service if valid-pending is set and not pending. */
-                if (s->chn[i].valid_pending && !s->service_pending) {
-                    s->service_pending = true;
-                    dma_service_bh(s);
+                if (s->chn[i].valid_pending) {
+                    dma_schedule(s);
                 }
             }
         }
@@ -659,47 +673,29 @@ static void dma_write(void *opaque, hwaddr offset, uint64_t value, unsigned size
 
             switch (ch_offset) {
             case CHN_CFG:
-                c->cfg = value & 0xffU;  /* store valid fields */
+                c->cfg = value;
                 trace_dma_chn_cfg(chn, c->cfg);
                 break;
 
             case CHN_CTLSTAT:
-                if (value & DMA_XFER_CLRTRIG) {
-                    c->ctlstat &= ~DMA_CTLSTAT_TRIG;
-                    trace_dma_ctlstat_clrtrig(chn);
-                } else {
-                    c->ctlstat = value & 0x23U;
-                    trace_dma_chn_ctlstat(chn, c->ctlstat);
-                }
+                /* CTLSTAT is read-only. */
+                trace_dma_chn_write_unimplemented(chn, CHN_CTLSTAT, value);
                 break;
 
             case CHN_XFERCFG: {
-                uint32_t old_xfercfg = c->xfercfg;
+                c->xfercfg = value & DMA_XFER_VALID_MASK & ~DMA_XFER_SWTRIG;
+                trace_dma_chn_xfercfg(chn, c->xfercfg);
 
-                if (value & DMA_XFER_CLRTRIG) {
-                    /* Software trigger — clear TRIG latch. */
-                    c->ctlstat &= ~DMA_CTLSTAT_TRIG;
-                    trace_dma_swtrig(chn);
-                } else {
-                    /* Store the programmed XFERCFG value. */
-                    c->xfercfg = value & 0xffffffc0U;  /* preserve control bits */
-                    trace_dma_chn_xfercfg(chn, c->xfercfg);
-
-                    /* If this is a reload after descriptor completion, re-arm. */
-                    if (old_xfercfg != c->xfercfg && c->busy) {
-                        unsigned new_count = DMA_XFER_COUNT(c->xfercfg);
-                        if (new_count >= c->remaining || c->next_desc == 0) {
-                            /* Reload from descriptor table to get fresh state. */
-                            dma_load_head_descriptor(s, chn);
-
-                            /* Schedule deferred service if not already pending. */
-                            if (!s->service_pending) {
-                                s->service_pending = true;
-                                dma_service_bh(s);
-                            }
-                        }
-                    }
+                if ((c->xfercfg & DMA_XFER_CFGVALID) && !c->busy) {
+                    dma_load_head_descriptor(s, chn);
                 }
+
+                if (value & DMA_XFER_SWTRIG) {
+                    c->ctlstat |= DMA_CTLSTAT_TRIG;
+                    trace_dma_swtrig(chn);
+                }
+
+                dma_schedule(s);
                 break;
             }
 
@@ -741,9 +737,8 @@ static void imxrt685_dma_dreq(void *opaque, int n, int level)
     trace_dma_dreq(chn, level);
 
     /* If the channel is valid-pending and not already being serviced, schedule. */
-    if (s->chn[chn].valid_pending && !s->service_pending) {
-        s->service_pending = true;
-        dma_service_bh(s);
+    if (s->chn[chn].valid_pending) {
+        dma_schedule(s);
     }
 }
 
@@ -776,12 +771,14 @@ static void dma_reset(DeviceState *dev)
         c->remaining = 0;
 
         c->dreq_level = false;
+        c->enabled = false;
         c->valid_pending = false;
         c->active = false;
         c->busy = false;
     }
 
     s->service_pending = false;
+    qemu_bh_cancel(s->service_bh);
 
     imxrt685_dma_update_irq(s);
 }
@@ -801,6 +798,7 @@ static const VMStateDescription vmstate_dma_ch = {
         VMSTATE_UINT32(next_desc, Imxrt685DmaChn),
         VMSTATE_UINT32(remaining, Imxrt685DmaChn),
         VMSTATE_BOOL(dreq_level, Imxrt685DmaChn),
+        VMSTATE_BOOL(enabled, Imxrt685DmaChn),
         VMSTATE_BOOL(valid_pending, Imxrt685DmaChn),
         VMSTATE_BOOL(active, Imxrt685DmaChn),
         VMSTATE_BOOL(busy, Imxrt685DmaChn),
@@ -834,7 +832,8 @@ static void dma_init(Object *obj)
 {
     Imxrt685DmaState *s = IMXRT685_DMA(obj);
 
-    /* Service is triggered via deferred calls from DREQ/MMIO handlers. */
+    s->service_bh = qemu_bh_new_guarded(dma_service_bh, s,
+                                        &DEVICE(s)->mem_reentrancy_guard);
 
     memory_region_init_io(&s->mmio, OBJECT(s), &dma_ops, s,
                           "imxrt685-dma", DMA_MMIO_SIZE);
@@ -846,6 +845,13 @@ static void dma_init(Object *obj)
         qdev_init_gpio_in_named(DEVICE(s), imxrt685_dma_dreq,
                                 "dma-dreq", i);
     }
+}
+
+static void dma_finalize(Object *obj)
+{
+    Imxrt685DmaState *s = IMXRT685_DMA(obj);
+
+    qemu_bh_delete(s->service_bh);
 }
 
 static void dma_class_init(ObjectClass *klass, const void *data)
@@ -862,6 +868,7 @@ static const TypeInfo dma_info = {
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Imxrt685DmaState),
     .instance_init = dma_init,
+    .instance_finalize = dma_finalize,
     .class_init = dma_class_init,
 };
 

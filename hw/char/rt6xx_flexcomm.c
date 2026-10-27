@@ -5,6 +5,8 @@
  * MIMXRT685S_cm33 CMSIS-SVD.  Transmission is synchronous from QEMU's
  * point of view; the TX FIFO therefore remains empty/not-full.
  *
+ * DMA DREQ outputs: one per direction (TX/RX), wired to DMA channel inputs.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -1008,7 +1010,8 @@ static uint64_t rt6xx_flexcomm_i2s_read(Rt6xxFlexcommState *s, hwaddr offset)
         }
         return 0;
     }
-}
+}/* fwd */
+static void rt6xx_flexcomm_i2s_update_dreq(Rt6xxFlexcommState *s);
 
 static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
                                      uint32_t val)
@@ -1023,6 +1026,7 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
         activity_changed = (cfg1 & I2S_CFG1_MAINENABLE) !=
                            (i->cfg1 & I2S_CFG1_MAINENABLE);
         i->cfg1 = cfg1;
+        rt6xx_flexcomm_i2s_update_dreq(s);
         break;
     }
     case 0xc04:
@@ -1035,7 +1039,7 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
         i->div = val & I2S_DIV_MASK;
         break;
     case 0xe00:
-        /* BIT(12)=TXDMA, BIT(13)=RXDMA are handled by the eDMA model. */
+        /* BIT(12)=TXDMA, BIT(13)=RXDMA wire to DMA channel DREQ inputs. */
         if (val & I2S_FIFOCFG_PACK48) {
             qemu_log_mask(LOG_UNIMP, "%s: I2S 48-bit packing is not "
                           "implemented\n", TYPE_RT6XX_FLEXCOMM);
@@ -1052,6 +1056,7 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
             i->rx_head = 0;
             i->rx_count = 0;
         }
+        rt6xx_flexcomm_i2s_update_dreq(s);
         break;
     case 0xe04:
         /* TXERR and RXERR are write-one-to-clear; the level bits
@@ -1062,6 +1067,7 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
         break;
     case 0xe08:
         i->fifotrig = val & I2S_FIFOTRIG_MASK;
+        rt6xx_flexcomm_i2s_update_dreq(s);
         break;
     case 0xe10:
         i->fifointenset |= val & I2S_FIFOINT_MASK;
@@ -1079,6 +1085,7 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
             i->tx_fifo[tail] = val;
             i->tx_count++;
         }
+        rt6xx_flexcomm_i2s_update_dreq(s);
         break;
     case 0xe24:
     case 0xe34:
@@ -1111,8 +1118,56 @@ static void rt6xx_flexcomm_i2s_write(Rt6xxFlexcommState *s, hwaddr offset,
     rt6xx_flexcomm_update_irq(s);
 }
 
-/* Forward declaration for rt6xx_flexcomm_i2s_on_sample_consumed. */
-static void rt6xx_flexcomm_i2s_on_sample_consumed(Rt6xxFlexcommState *s);
+/*
+ * Recompute and output DMA DREQ levels for both TX and RX directions.
+ *
+ * TX DREQ: asserted when I2S + DMATX + TXLVLENA enabled AND
+ *          tx_count <= TXLVL (TXLVL=0 means "empty" triggers immediately).
+ * RX DREQ: asserted when I2S + DMARX + RXLVLENA enabled AND
+ *          rx_count > RXLVL (RXLVL=0 means "1 entry" triggers).
+ *
+ * Called whenever FIFO counts or any enabling register changes.
+ */
+static void rt6xx_flexcomm_i2s_update_dreq(Rt6xxFlexcommState *s)
+{
+    Rt6xxFlexcommI2sState *i = &s->i2s;
+    bool tx_active, rx_active;
+    unsigned tx_trigger, rx_trigger;
+
+    if (!rt6xx_flexcomm_i2s_selected(s)) {
+        /* Not I2S mode — deassert both DREQs. */
+        qemu_set_irq(s->i2s.dreq_tx, 0);
+        qemu_set_irq(s->i2s.dreq_rx, 0);
+        return;
+    }
+
+    if (!(i->cfg1 & I2S_CFG1_MAINENABLE)) {
+        /* I2S main not enabled — deassert both. */
+        qemu_set_irq(s->i2s.dreq_tx, 0);
+        qemu_set_irq(s->i2s.dreq_rx, 0);
+        return;
+    }
+
+    tx_trigger = extract32(i->fifotrig, 8, 4);  /* TXLVL field */
+    rx_trigger = extract32(i->fifotrig, 16, 4); /* RXLVL field */
+
+    /* TX DREQ: active when I2S + DMATX + TXLVLENA and tx_count <= TXLVL. */
+    tx_active = (i->fifocfg & FIFOCFG_ENABLETX) &&
+                (i->fifocfg & I2S_FIFOCFG_TXDMA) &&
+                (i->fifotrig & I2S_FIFOTRIG_TXLVLENA) &&
+                (i->tx_count <= tx_trigger);
+    qemu_set_irq(s->i2s.dreq_tx, tx_active ? 1 : 0);
+
+    /* RX DREQ: active when I2S + DMARX + RXLVLENA and rx_count > RXLVL. */
+    rx_active = (i->fifocfg & FIFOCFG_ENABLERX) &&
+                (i->fifocfg & I2S_FIFOCFG_RXDMA) &&
+                (i->fifotrig & I2S_FIFOTRIG_RXLVLENA) &&
+                (i->rx_count > rx_trigger);
+    qemu_set_irq(s->i2s.dreq_rx, rx_active ? 1 : 0);
+
+    trace_rt6xx_flexcomm_i2s_dreq(DEVICE(s)->canonical_path,
+                                  tx_active || rx_active);
+}
 
 /*
  * Board audio endpoint.  The link only calls these while the
@@ -1162,9 +1217,9 @@ static bool rt6xx_flexcomm_endpoint_pop(Rt685AudioEndpoint *ep,
     i->tx_count--;
     rt6xx_flexcomm_update_irq(s);
 
-    /* Notify eDMA that a sample was consumed — may trigger DREQ. */
+    /* Recompute TX DREQ after sample consumption. */
     if (i->fifocfg & I2S_FIFOCFG_TXDMA) {
-        rt6xx_flexcomm_i2s_on_sample_consumed(s);
+        rt6xx_flexcomm_i2s_update_dreq(s);
     }
     return true;
 }
@@ -1179,8 +1234,8 @@ static bool rt6xx_flexcomm_endpoint_is_active(Rt685AudioEndpoint *ep,
 }
 
 /*
- * Push a sample into the Flexcomm I2S TX FIFO.  Called by the eDMA model
- * when DOFF==0 (fixed destination write to FIFO).
+ * Push a sample into the Flexcomm I2S TX FIFO.  Called by the DMA
+ * model when DOFF==0 (fixed destination write to FIFO).
  */
 bool rt6xx_flexcomm_i2s_fifo_push(Rt6xxFlexcommState *s, uint32_t sample)
 {
@@ -1204,49 +1259,12 @@ bool rt6xx_flexcomm_i2s_fifo_push(Rt6xxFlexcommState *s, uint32_t sample)
     trace_rt6xx_flexcomm_i2s_dma_push(DEVICE(s)->canonical_path, sample);
     rt6xx_flexcomm_update_irq(s);
 
-    /* Check if we should deassert DREQ (FIFO now above watermark). */
-    unsigned tx_trigger = extract32(i->fifotrig, 8, 4);
-    bool dreq_active = i->tx_count > tx_trigger;
-    bool old_dreq = s->i2s.dreq_asserted;
-
-    if (dreq_active != old_dreq) {
-        s->i2s.dreq_asserted = dreq_active;
-        if (s->i2s.dreq_assert && s->i2s.dreq_opaque) {
-            s->i2s.dreq_assert(s->i2s.dreq_opaque, dreq_active ? 1 : 0);
-        }
-    }
+    /* Recompute DREQ after FIFO count changes. */
+    rt6xx_flexcomm_i2s_update_dreq(s);
     return true;
 }
 
-/*
- * Called by the audio-link when a sample is popped from the TX FIFO for
- * playback.  Triggers DREQ to eDMA if the FIFO now falls below watermark.
- */
-static void rt6xx_flexcomm_i2s_on_sample_consumed(Rt6xxFlexcommState *s)
-{
-    Rt6xxFlexcommI2sState *i = &s->i2s;
 
-    /* Only TX direction with DMA enabled generates DREQ. */
-    if (!(rt6xx_flexcomm_i2s_tx_active(s))) {
-        return;
-    }
-    if (!(i->fifocfg & I2S_FIFOCFG_TXDMA)) {
-        return;
-    }
-
-    unsigned tx_trigger = extract32(i->fifotrig, 8, 4);
-    bool dreq_active = i->tx_count > tx_trigger;
-    bool old_dreq = s->i2s.dreq_asserted;
-
-    if (dreq_active != old_dreq) {
-        s->i2s.dreq_asserted = dreq_active;
-        trace_rt6xx_flexcomm_i2s_dreq(DEVICE(s)->canonical_path,
-                                      dreq_active);
-        if (s->i2s.dreq_assert && s->i2s.dreq_opaque) {
-            s->i2s.dreq_assert(s->i2s.dreq_opaque, dreq_active ? 1 : 0);
-        }
-    }
-}
 
 static void rt6xx_flexcomm_i2s_reset_state(Rt6xxFlexcommState *s)
 {
@@ -1266,8 +1284,7 @@ static void rt6xx_flexcomm_i2s_reset_state(Rt6xxFlexcommState *s)
     i->tx_count = 0;
     i->rx_head = 0;
     i->rx_count = 0;
-    s->i2s.dreq_asserted = false;
-    rt6xx_flexcomm_i2s_link_update(s);
+    rt6xx_flexcomm_i2s_update_dreq(s);
 }
 
 static bool rt6xx_flexcomm_active(Rt6xxFlexcommState *s)
@@ -1897,6 +1914,9 @@ static void rt6xx_flexcomm_init(Object *obj)
                             "clock-enabled", 1);
     qdev_init_gpio_in_named(dev, rt6xx_flexcomm_set_reset,
                             "reset", 1);
+    /* DMA DREQ outputs: TX and RX direction. */
+    qdev_init_gpio_out_named(dev, &s->i2s.dreq_tx, "dma-dreq-tx", 1);
+    qdev_init_gpio_out_named(dev, &s->i2s.dreq_rx, "dma-dreq-rx", 1);
     qdev_init_gpio_in_named(dev, rt6xx_flexcomm_spi_slave_ssel,
                             RT6XX_FLEXCOMM_SPI_SLAVE_SSEL,
                             SPI_SSEL_COUNT);

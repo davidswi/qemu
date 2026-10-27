@@ -1,16 +1,21 @@
 /*
- * NXP MIMXRT685 DMA Controller (SDK-compatible lightweight model)
+ * NXP MIMXRT685 DMA0 Controller (SDK-compatible model)
  *
- * Models the subset of registers that the MCUXpresso SDK's fsl_dma.c /
- * fsl_i2s_dma.c driver accesses for I2S audio transfers.  This is NOT eDMA;
- * it is NXP's older peripheral DMA controller found at base address 0x40104000
- * (non-secure) / 0x50104000 (secure).
+ * Implements the descriptor-driven, DREQ-paced peripheral DMA controller
+ * used by fsl_dma.c / fsl_i2s_dma.c for I2S audio transfers.  This is NOT
+ * eDMA; it models NXP's older peripheral DMA at base address 0x40104000
+ * (non-secure).
  *
- * Register layout per channel n:
- *   CFG     at offset 0x400 + n*0x10 — PERIPHREQEN(0), HWTRIGEN(1)
- *   XFERCFG at offset 0x408 + n*0x10 — transfer count (bits 0:9), SWTRIG(12)
+ * Key behaviors:
+ *   - Descriptor table loaded from SRAMBASE; linked descriptors follow.
+ *   - XFERCFG encodes count-minus-one, width, increments, and control bits.
+ *   - DREQ pacing for peripheral transfers when PERIPHREQEN is set.
+ *   - INTA/INTB completion flags with proper pending/enabled IRQ derivation.
+ *   - Software trigger (SWTRIG) sets the channel TRIG latch; HWTRIGEN is
+ *     a separate hardware-trigger-input path.
  *
- * This is a local hardware-enablement device and must not be submitted upstream.
+ * This is a local hardware-enablement device and must not be submitted
+ * upstream.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -21,155 +26,463 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
-#include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "trace.h"
+#include "hw/dma/imxrt685_dma.h"
 
-/* Per-channel register stride. */
-#define DMA_CHN_STRIDE   0x10
+/* MMIO aperture. */
+#define DMA_MMIO_SIZE  0x1000
 
-/* Channel CFG offsets within the MMIO window. */
-#define DMA_CHN_CFG       0x400
-#define DMA_CHN_XFERCFG   0x408
+/* Channel register base offset within the window. */
+#define DMA_CHN_BASE   0x400
+#define DMA_CHN_STRIDE 0x10
 
-/* CTRL bits. */
-#define DMA_CTRL_ENABLE   BIT(0)
+/* Common register offsets. */
+#define REG_CTRL        0x000
+#define REG_INTSTAT     0x004
+#define REG_SRAMBASE    0x008
+#define REG_ENABLESET   0x020
+#define REG_ENABLECLR   0x028
+#define REG_ACTIVE      0x030
+#define REG_BUSY        0x038
+#define REG_ERRINT      0x040
+#define REG_INTENSET    0x048
+#define REG_INTENCLR    0x050
+#define REG_INTA        0x058
+#define REG_INTB        0x060
+#define REG_SETVALID    0x068
+#define REG_SETTRIG     0x070
+#define REG_ABORT       0x078
 
-/* XFERCFG bits — SDK uses these for transfer count and software trigger. */
-#define DMA_XFER_COUNT    0x3FFU          /* bits 0:9 - number of transfers */
-#define DMA_XFER_SWTRIG   BIT(12)         /* bit 12 - software trigger */
+/* Channel register offsets within the channel block. */
+#define CHN_CFG        0x00
+#define CHN_CTLSTAT    0x04
+#define CHN_XFERCFG    0x08
 
-/* CFG bits. */
-#define DMA_CFG_PERIPHREQEN  BIT(0)      /* hardware request enabled */
-#define DMA_CFG_HWTRIGEN     BIT(1)      /* hardware triggering enabled */
+/* Maximum beats per service pass to prevent runaway loops. */
+#define MAX_BEATS_PER_PASS 256
 
-/* Channel count (from CMSIS header). */
-#define DMA_CHANNEL_COUNT   33
+/* Forward declaration for deferred service callback. */
+static void dma_service_bh(Imxrt685DmaState *s);
 
-/* Per-channel state. */
-typedef struct Imxrt685DmaChn {
-    uint32_t cfg;          /* Channel configuration        */
-    uint32_t xfercfg;      /* Transfer configuration       */
-} Imxrt685DmaChn;
+/* ----------------------------------------------------------------------- */
+/* IRQ derivation                                                          */
+/* ----------------------------------------------------------------------- */
 
-#define TYPE_IMXRT685_DMA "imxrt685-dma"
-OBJECT_DECLARE_SIMPLE_TYPE(Imxrt685DmaState, IMXRT685_DMA)
-
-struct Imxrt685DmaState {
-    SysBusDevice parent_obj;
-
-    MemoryRegion mmio;     /* DMA register space             */
-    qemu_irq irq;          /* Completion interrupt to NVIC   */
-    QEMUTimer *timer[DMA_CHANNEL_COUNT];  /* Per-channel timer for cadence */
-
-    uint32_t ctrl;         /* CTRL register (enable bit)     */
-    hwaddr srambase;       /* SRAMBASE (descriptor table addr) */
-
-    Imxrt685DmaChn chn[DMA_CHANNEL_COUNT];  /* Per-channel state */
-
-    uint32_t sample_rate;  /* Audio cadence for DREQ timing  */
-};
-
-/* Handle a software trigger on the given channel. */
-static void dma_sw_trigger(Imxrt685DmaState *s, unsigned ch)
+static void imxrt685_dma_update_irq(Imxrt685DmaState *s)
 {
-    Imxrt685DmaChn *chn = &s->chn[ch];
+    uint32_t normal = (s->inta | s->intb) & s->inten;
+    uint32_t error  = s->errint & s->inten;
 
-    if (!(chn->cfg & DMA_CFG_PERIPHREQEN)) {
-        return;  /* Only hardware-triggered channels matter for I2S */
+    bool new_state = (normal != 0 || error != 0);
+
+    if (new_state != s->irq_state) {
+        trace_dma_irq_transition(new_state ? "raise" : "lower",
+                                 normal, error);
+        qemu_set_irq(s->irq, new_state);
+        s->irq_state = new_state;
     }
-
-    trace_dma_sw_trigger(ch);
 }
 
-/* Handle hardware/peripheral request on channel. */
-static void dma_periph_request(Imxrt685DmaState *s, unsigned ch)
+/* ----------------------------------------------------------------------- */
+/* Descriptor loading                                                      */
+/* ----------------------------------------------------------------------- */
+
+static bool dma_fetch_descriptor(Imxrt685DmaState *s, hwaddr addr,
+                                 DMADescriptor *desc)
 {
-    Imxrt685DmaChn *chn = &s->chn[ch];
-    uint32_t count;
+    AddressSpace *as = get_system_memory();
 
-    if (!(chn->cfg & DMA_CFG_HWTRIGEN)) {
-        return;  /* Hardware triggering disabled for this channel */
-    }
-    if (chn->xfercfg == 0) {
-        return;  /* No transfer configured */
+    if (address_space_rw(as, addr, MEMTXATTRS_UNSPECIFIED,
+                         (uint8_t *)desc, sizeof(*desc), false) != MEMTX_OK) {
+        trace_dma_descriptor_fetch_error(addr);
+        return false;
     }
 
-    trace_dma_periph_request(ch, chn->xfercfg);
+    desc->xfercfg = le32_to_cpu(desc->xfercfg);
+    desc->src_end = le32_to_cpu(desc->src_end);
+    desc->dst_end = le32_to_cpu(desc->dst_end);
+    desc->link = le32_to_cpu(desc->link);
 
-    /* Read the transfer count from XFERCFG. */
-    count = chn->xfercfg & DMA_XFER_COUNT;
-    if (count == 0) {
+    /* Validate link alignment (must be 16-byte aligned). */
+    if (desc->link && (desc->link & 0xf)) {
+        trace_dma_descriptor_link_misaligned(desc->link);
+        s->errint |= BIT(0);
+        return false;
+    }
+
+    trace_dma_descriptor_loaded(addr, desc->xfercfg, desc->src_end,
+                                desc->dst_end, desc->link);
+    return true;
+}
+
+static void dma_load_channel_from_desc(Imxrt685DmaState *s, unsigned chn,
+                                       const DMADescriptor *desc)
+{
+    Imxrt685DmaChn *c = &s->chn[chn];
+    unsigned width_bytes;
+
+    c->xfercfg  = desc->xfercfg;
+    c->next_desc = desc->link;
+    c->remaining = DMA_XFER_COUNT(desc->xfercfg) + 1; /* N = count+1 */
+
+    /* Decode transfer parameters. */
+    unsigned width = DMA_XFER_WIDTH(desc->xfercfg);
+    if (width > 2) {
+        trace_dma_error_invalid_width(chn, width);
+        s->errint |= BIT(chn);
+        return;
+    }
+    width_bytes = dma_width_bytes(width);
+
+    unsigned src_inc = DMA_XFER_SRCINC(desc->xfercfg);
+    unsigned dst_inc = DMA_XFER_DSTINC(desc->xfercfg);
+
+    /* NXP descriptors store END addresses, not start. */
+    c->current_src = desc->src_end - (c->remaining - 1) * width_bytes * src_inc;
+    c->current_dst = desc->dst_end - (c->remaining - 1) * width_bytes * dst_inc;
+
+    trace_dma_channel_loaded(chn, c->xfercfg, c->current_src,
+                             c->current_dst, c->remaining);
+}
+
+static void dma_load_head_descriptor(Imxrt685DmaState *s, unsigned chn)
+{
+    Imxrt685DmaChn *c = &s->chn[chn];
+    hwaddr desc_addr;
+    DMADescriptor desc;
+
+    if (!s->srambase || !(s->ctrl & DMA_CTRL_ENABLE)) {
         return;
     }
 
-    /* Decrement and check for completion. */
-    uint32_t new_count = (chn->xfercfg & ~DMA_XFER_COUNT) | (count - 1);
-    chn->xfercfg = new_count;
+    desc_addr = s->srambase + chn * 16;
 
-    trace_dma_transfer_active(ch, count - 1);
-
-    if ((chn->xfercfg & DMA_XFER_SWTRIG)) {
-        /* Transfer complete — assert interrupt. */
-        qemu_set_irq(s->irq, true);
-        trace_imxrt685_dma_ch_complete(ch);
-    } else if (count > 1) {
-        /* More transfers pending — schedule next at audio cadence. */
-        int64_t deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                           NANOSECONDS_PER_SECOND / s->sample_rate;
-
-        timer_mod(s->timer[ch], deadline);
+    if (dma_fetch_descriptor(s, desc_addr, &desc)) {
+        dma_load_channel_from_desc(s, chn, &desc);
+        c->next_desc = desc.link;
+        c->active = false;
+        c->busy = true;
     } else {
-        trace_imxrt685_dma_ch_done(ch);
+        trace_dma_error_descriptor_fetch(chn);
+        s->errint |= BIT(chn);
+        c->valid_pending = false;
+        c->active = false;
+        c->busy = false;
     }
 }
 
-/* MMIO read handler. */
+/* ----------------------------------------------------------------------- */
+/* Transfer beat                                                           */
+/* ----------------------------------------------------------------------- */
+
+static bool dma_do_beat(Imxrt685DmaState *s, unsigned chn)
+{
+    Imxrt685DmaChn *c = &s->chn[chn];
+    uint32_t data = 0;
+    AddressSpace *as = get_system_memory();
+
+    /* Decode width and increments from the live XFERCFG. */
+    unsigned width = DMA_XFER_WIDTH(c->xfercfg);
+    if (width > 2) {
+        trace_dma_error_invalid_width(chn, width);
+        return false;
+    }
+    unsigned bytes = dma_width_bytes(width);
+
+    unsigned src_inc = DMA_XFER_SRCINC(c->xfercfg);
+    unsigned dst_inc = DMA_XFER_DSTINC(c->xfercfg);
+    hwaddr old_src = c->current_src;
+    hwaddr old_dst = c->current_dst;
+
+    /* Read from source. */
+    if (address_space_rw(as, c->current_src, MEMTXATTRS_UNSPECIFIED,
+                         (uint8_t *)&data, bytes, true) != MEMTX_OK) {
+        trace_dma_error_bus_fault(chn, "read src", c->current_src);
+        s->errint |= BIT(chn);
+        return false;
+    }
+
+    /* Mask to actual width. */
+    switch (bytes) {
+    case 1: data &= 0xffU; break;
+    case 2: data &= 0xffffU; break;
+    default: break;
+    }
+
+    /* Write to destination. */
+    if (address_space_rw(as, c->current_dst, MEMTXATTRS_UNSPECIFIED,
+                         (uint8_t *)&data, bytes, false) != MEMTX_OK) {
+        trace_dma_error_bus_fault(chn, "write dst", c->current_dst);
+        s->errint |= BIT(chn);
+        return false;
+    }
+
+    /* Advance addresses. */
+    if (src_inc) {
+        c->current_src += bytes * src_inc;
+    }
+    if (dst_inc) {
+        c->current_dst += bytes * dst_inc;
+    }
+
+    /* Decrement remaining count. */
+    c->remaining--;
+    trace_dma_beat(chn, c->xfercfg, data,
+                   old_src, old_dst);
+
+    return true;
+}
+
+/* ----------------------------------------------------------------------- */
+/* Descriptor completion                                                   */
+/* ----------------------------------------------------------------------- */
+
+static void dma_channel_complete(Imxrt685DmaState *s, unsigned chn)
+{
+    Imxrt685DmaChn *c = &s->chn[chn];
+    bool reload = false;
+
+    c->active = false;
+    c->busy = false;
+
+    /* Determine which interrupts to set. */
+    if (c->xfercfg & DMA_XFER_INTA) {
+        s->inta |= BIT(chn);
+    }
+    if (c->xfercfg & DMA_XFER_INTB) {
+        s->intb |= BIT(chn);
+    }
+
+    /* Process CLRTRIG. */
+    if (c->xfercfg & DMA_XFER_CLRTRIG) {
+        c->ctlstat &= ~DMA_CTLSTAT_TRIG;
+    }
+
+    trace_dma_descriptor_complete(chn, s->inta, s->intb);
+
+    /* Check for reload. */
+    if ((c->xfercfg & BIT(5)) && c->next_desc && !reload) {
+        DMADescriptor desc;
+
+        if (dma_fetch_descriptor(s, c->next_desc, &desc)) {
+            dma_load_channel_from_desc(s, chn, &desc);
+            c->active = true;
+            reload = true;
+            trace_dma_descriptor_reload(chn, c->next_desc);
+        } else {
+            s->errint |= BIT(chn);
+        }
+    }
+
+    if (!reload) {
+        c->valid_pending = false;
+        trace_dma_channel_stopped(chn);
+    }
+
+    imxrt685_dma_update_irq(s);
+}
+
+/* ----------------------------------------------------------------------- */
+/* Deferred service                                                        */
+/* ----------------------------------------------------------------------- */
+
+static void dma_service_bh(Imxrt685DmaState *s)
+{
+    unsigned pri, chn_pri, best_chn = 0;
+    int i;
+
+    s->service_pending = false;
+
+    /* Find highest-priority channel (lowest numeric priority). */
+    for (i = 0; i < DMA_CHANNEL_COUNT; i++) {
+        Imxrt685DmaChn *c = &s->chn[i];
+
+        if (!c->valid_pending || !c->dreq_level) {
+            continue;
+        }
+        if (!(s->ctrl & DMA_CTRL_ENABLE)) {
+            break;
+        }
+
+        chn_pri = (c->cfg >> 3) & 7;  /* priority bits */
+
+        if (!best_chn || chn_pri < pri) {
+            best_chn = i;
+            pri = chn_pri;
+        } else if (chn_pri == pri && i < best_chn) {
+            best_chn = i;
+        }
+    }
+
+    if (best_chn) {
+        Imxrt685DmaChn *c = &s->chn[best_chn];
+        unsigned beats = 0;
+
+        while (beats < MAX_BEATS_PER_PASS && c->remaining > 0) {
+            bool dreq_required = c->cfg & DMA_CFG_PERIPHREQEN;
+
+            /* If DREQ is required, only proceed if asserted. */
+            if (dreq_required && !c->dreq_level) {
+                break;
+            }
+
+            c->active = true;
+            c->busy = true;
+            c->ctlstat |= DMA_CTLSTAT_TRIG;  /* clear trigger on active */
+
+            if (!dma_do_beat(s, best_chn)) {
+                /* Beat failed — channel is faulted. */
+                dma_channel_complete(s, best_chn);
+                return;
+            }
+
+            beats++;
+
+            if (c->remaining == 0) {
+                dma_channel_complete(s, best_chn);
+                c->busy = false;
+                break;
+            }
+
+            /* For peripheral requests, re-check DREQ after each beat. */
+            if (dreq_required && !c->dreq_level) {
+                c->active = false;
+                break;
+            }
+        }
+
+        if (!c->busy || beats == MAX_BEATS_PER_PASS) {
+            c->active = false;
+        }
+
+        imxrt685_dma_update_irq(s);
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* MMIO handlers                                                           */
+/* ----------------------------------------------------------------------- */
+
 static uint64_t dma_read(void *opaque, hwaddr offset, unsigned size)
 {
     Imxrt685DmaState *s = IMXRT685_DMA(opaque);
-    unsigned ch;
+    unsigned chn;
     uint32_t val;
 
     switch (offset) {
-    case 0x000:     /* CTRL */
+    case REG_CTRL:
         return s->ctrl;
-    case 0x008:     /* SRAMBASE */
-        return s->srambase;
-    default:
-        /* Channel register access. */
-        if (offset >= DMA_CHN_CFG && offset < DMA_CHN_CFG + DMA_CHANNEL_COUNT * DMA_CHN_STRIDE) {
-            ch = (offset - DMA_CHN_CFG) / DMA_CHN_STRIDE;
-            hwaddr ch_offset = (offset - DMA_CHN_CFG) % DMA_CHN_STRIDE;
 
-            if (ch < DMA_CHANNEL_COUNT) {
-                val = 0;
-                switch (ch_offset) {
-                case 0x0:     /* CFG */
-                    val = s->chn[ch].cfg;
-                    break;
-                case 0x8:     /* XFERCFG */
-                    val = s->chn[ch].xfercfg;
-                    break;
-                }
-                trace_dma_read(ch, ch_offset, offset, val);
-                return val;
+    case REG_INTSTAT: {
+        uint32_t normal = (s->inta | s->intb) & s->inten;
+        uint32_t error  = s->errint & s->inten;
+        val = (normal != 0);  /* ACTIVEINT summary */
+        if (error) {
+            val |= BIT(1);      /* ACTIVEERRINT */
+        }
+        return val;
+    }
+
+    case REG_SRAMBASE:
+        return s->srambase;
+
+    case REG_ENABLESET:
+        /* Read as CTRL mask for enabled channels. */
+        val = 0;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (s->chn[i].valid_pending) {
+                val |= BIT(i);
             }
         }
+        return val;
+
+    case REG_ACTIVE:
+        /* Show channels currently active. */
+        val = 0;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (s->chn[i].active) {
+                val |= BIT(i);
+            }
+        }
+        return val;
+
+    case REG_BUSY:
+        /* Show channels with in-flight work. */
+        val = 0;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (s->chn[i].busy) {
+                val |= BIT(i);
+            }
+        }
+        return val;
+
+    case REG_ENABLECLR:
+        /* Read as zero — write-only. */
+        return 0;
+
+    case REG_ERRINT:
+        val = s->errint;
+        trace_dma_read(REG_ERRINT, val);
+        return val;
+
+    case REG_INTENSET:
+        return s->inten;
+
+    case REG_INTA: {
+        val = s->inta;
+        trace_dma_read(REG_INTA, val);
+        return val;
+    }
+
+    case REG_INTB: {
+        val = s->intb;
+        trace_dma_read(REG_INTB, val);
+        return val;
+    }
+
+    default:
+        /* Channel register access. */
+        if (offset >= DMA_CHN_BASE &&
+            offset < DMA_CHN_BASE + DMA_CHANNEL_COUNT * DMA_CHN_STRIDE) {
+            chn = (offset - DMA_CHN_BASE) / DMA_CHN_STRIDE;
+            hwaddr ch_offset = (offset - DMA_CHN_BASE) % DMA_CHN_STRIDE;
+
+            if (chn >= DMA_CHANNEL_COUNT) {
+                trace_dma_read_chn_oob(offset);
+                return 0;
+            }
+
+            Imxrt685DmaChn *c = &s->chn[chn];
+            val = 0;
+            switch (ch_offset) {
+            case CHN_CFG:
+                val = c->cfg;
+                break;
+            case CHN_CTLSTAT:
+                val = c->ctlstat | (c->valid_pending ? DMA_CTLSTAT_VALIDPENDING : 0);
+                break;
+            case CHN_XFERCFG:
+                val = c->xfercfg;
+                break;
+            }
+            trace_dma_read_chn(chn, ch_offset, val);
+            return val;
+        }
+
         trace_dma_read_unimplemented(offset);
         return 0;
     }
 }
 
-/* MMIO write handler. */
 static void dma_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
     Imxrt685DmaState *s = IMXRT685_DMA(opaque);
-    unsigned ch;
+    unsigned chn;
     hwaddr ch_offset;
 
     switch (offset) {
-    case 0x000:     /* CTRL — write enable to set bit */
+    case REG_CTRL:
         if (value & DMA_CTRL_ENABLE) {
             s->ctrl |= DMA_CTRL_ENABLE;
             trace_dma_ctrl_enable();
@@ -178,37 +491,220 @@ static void dma_write(void *opaque, hwaddr offset, uint64_t value, unsigned size
             trace_dma_ctrl_disable();
         }
         break;
-    case 0x008:     /* SRAMBASE */
-        s->srambase = value & ~0x1FFULL;
+
+    case REG_INTSTAT:
+        /* Write to clear ACTIVEINT and ACTIVEERRINT (read-only in practice). */
+        break;
+
+    case REG_SRAMBASE:
+        s->srambase = value & ~0x1FFULL;  /* 512-byte alignment */
         trace_dma_srambase(s->srambase);
         break;
-    default:
-        if (offset >= DMA_CHN_CFG && offset < DMA_CHN_CFG + DMA_CHANNEL_COUNT * DMA_CHN_STRIDE) {
-            ch = (offset - DMA_CHN_CFG) / DMA_CHN_STRIDE;
-            ch_offset = (offset - DMA_CHN_CFG) % DMA_CHN_STRIDE;
 
-            if (ch >= DMA_CHANNEL_COUNT) {
-                trace_dma_write_chn_oob(ch);
+    case REG_ENABLESET: {
+        uint32_t mask = value & 0x1FFFFFFFL;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (mask & BIT(i)) {
+                s->chn[i].valid_pending = true;
+                trace_dma_enable_set(i);
+
+                /* If head descriptor hasn't been loaded, load it now. */
+                Imxrt685DmaChn *c = &s->chn[i];
+                if (!c->busy && !c->next_desc) {
+                    dma_load_head_descriptor(s, i);
+                } else if (c->busy && c->remaining == 0) {
+                    /* Descriptor completed but needs reload from SDK. */
+                    dma_channel_complete(s, i);
+                }
+
+                /* Schedule deferred service if not already pending. */
+                if (!s->service_pending) {
+                    s->service_pending = true;
+                    dma_service_bh(s);
+                }
+            }
+        }
+        break;
+    }
+
+    case REG_ENABLECLR: {
+        uint32_t mask = value & 0x1FFFFFFFL;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (mask & BIT(i)) {
+                Imxrt685DmaChn *c = &s->chn[i];
+
+                c->valid_pending = false;
+                c->ctlstat &= ~DMA_CTLSTAT_TRIG;
+                trace_dma_enable_clear(i);
+
+                /* If busy, complete and stop. */
+                if (c->busy) {
+                    c->active = false;
+                    c->busy = false;
+                    dma_channel_complete(s, i);
+                }
+
+                imxrt685_dma_update_irq(s);
+            }
+        }
+        break;
+    }
+
+    case REG_ERRINT:
+        /* W1C — clear error flags. */
+        s->errint &= ~value;
+        trace_dma_errint_clear(value);
+        imxrt685_dma_update_irq(s);
+        break;
+
+    case REG_INTENSET: {
+        uint32_t mask = value & 0x1FFFFFFFL;
+        s->inten |= mask;
+        trace_dma_inten_set(mask);
+        imxrt685_dma_update_irq(s);
+        break;
+    }
+
+    case REG_INTENCLR: {
+        uint32_t mask = value & 0x1FFFFFFFL;
+        s->inten &= ~mask;
+        trace_dma_inten_clear(mask);
+        imxrt685_dma_update_irq(s);
+        break;
+    }
+
+    case REG_INTA:
+        /* W1C — clear INTA flags. */
+        s->inta &= ~value;
+        trace_dma_inta_clear(value);
+        imxrt685_dma_update_irq(s);
+        break;
+
+    case REG_INTB:
+        /* W1C — clear INTB flags. */
+        s->intb &= ~value;
+        trace_dma_intb_clear(value);
+        imxrt685_dma_update_irq(s);
+        break;
+
+    case REG_SETVALID: {
+        uint32_t mask = value & 0x1FFFFFFFL;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (mask & BIT(i)) {
+                s->chn[i].valid_pending = true;
+                trace_dma_setvalid(i);
+
+                /* If head descriptor hasn't been loaded, load it now. */
+                Imxrt685DmaChn *c = &s->chn[i];
+                if (!c->busy && !c->next_desc) {
+                    dma_load_head_descriptor(s, i);
+                }
+
+                /* Schedule deferred service if not already pending. */
+                if (!s->service_pending) {
+                    s->service_pending = true;
+                    dma_service_bh(s);
+                }
+            }
+        }
+        break;
+    }
+
+    case REG_SETTRIG: {
+        uint32_t mask = value & 0x1FFFFFFFL;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (mask & BIT(i)) {
+                s->chn[i].ctlstat |= DMA_CTLSTAT_TRIG;
+                trace_dma_settrig(i);
+
+                /* Schedule deferred service if valid-pending is set and not pending. */
+                if (s->chn[i].valid_pending && !s->service_pending) {
+                    s->service_pending = true;
+                    dma_service_bh(s);
+                }
+            }
+        }
+        break;
+    }
+
+    case REG_ABORT: {
+        uint32_t mask = value & 0x1FFFFFFFL;
+        for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+            if (mask & BIT(i)) {
+                Imxrt685DmaChn *c = &s->chn[i];
+
+                trace_dma_abort(i);
+                c->valid_pending = false;
+                c->ctlstat &= ~DMA_CTLSTAT_TRIG;
+                c->active = false;
+                c->busy = false;
+            }
+        }
+        break;
+    }
+
+    default:
+        /* Channel register access. */
+        if (offset >= DMA_CHN_BASE &&
+            offset < DMA_CHN_BASE + DMA_CHANNEL_COUNT * DMA_CHN_STRIDE) {
+            chn = (offset - DMA_CHN_BASE) / DMA_CHN_STRIDE;
+            ch_offset = (offset - DMA_CHN_BASE) % DMA_CHN_STRIDE;
+
+            if (chn >= DMA_CHANNEL_COUNT) {
+                trace_dma_write_chn_oob(chn);
                 return;
             }
 
-            Imxrt685DmaChn *chn = &s->chn[ch];
+            Imxrt685DmaChn *c = &s->chn[chn];
 
             switch (ch_offset) {
-            case 0x0:     /* CFG */
-                chn->cfg = value & 0xfU;  /* Only bits 0-3 used by SDK */
-                trace_dma_chn_cfg(ch, chn->cfg);
+            case CHN_CFG:
+                c->cfg = value & 0xffU;  /* store valid fields */
+                trace_dma_chn_cfg(chn, c->cfg);
                 break;
-            case 0x8:     /* XFERCFG */
-                if (value & DMA_XFER_SWTRIG) {
-                    dma_sw_trigger(s, ch);
+
+            case CHN_CTLSTAT:
+                if (value & DMA_XFER_CLRTRIG) {
+                    c->ctlstat &= ~DMA_CTLSTAT_TRIG;
+                    trace_dma_ctlstat_clrtrig(chn);
                 } else {
-                    chn->xfercfg = value & 0xfU;
-                    trace_dma_chn_xfercfg(ch, chn->xfercfg);
+                    c->ctlstat = value & 0x23U;
+                    trace_dma_chn_ctlstat(chn, c->ctlstat);
                 }
                 break;
+
+            case CHN_XFERCFG: {
+                uint32_t old_xfercfg = c->xfercfg;
+
+                if (value & DMA_XFER_CLRTRIG) {
+                    /* Software trigger — clear TRIG latch. */
+                    c->ctlstat &= ~DMA_CTLSTAT_TRIG;
+                    trace_dma_swtrig(chn);
+                } else {
+                    /* Store the programmed XFERCFG value. */
+                    c->xfercfg = value & 0xffffffc0U;  /* preserve control bits */
+                    trace_dma_chn_xfercfg(chn, c->xfercfg);
+
+                    /* If this is a reload after descriptor completion, re-arm. */
+                    if (old_xfercfg != c->xfercfg && c->busy) {
+                        unsigned new_count = DMA_XFER_COUNT(c->xfercfg);
+                        if (new_count >= c->remaining || c->next_desc == 0) {
+                            /* Reload from descriptor table to get fresh state. */
+                            dma_load_head_descriptor(s, chn);
+
+                            /* Schedule deferred service if not already pending. */
+                            if (!s->service_pending) {
+                                s->service_pending = true;
+                                dma_service_bh(s);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+
             default:
-                /* Ignore writes to reserved/other register bits. */
+                trace_dma_chn_write_unimplemented(chn, ch_offset, value);
                 break;
             }
         } else {
@@ -228,14 +724,32 @@ static const MemoryRegionOps dma_ops = {
     },
 };
 
-/* Handle DREQ from a Flexcomm I2S peripheral — triggers DMA transfer on ch. */
-void imxrt685_dma_handle_dreq(Imxrt685DmaState *s, unsigned ch, int level)
+/* ----------------------------------------------------------------------- */
+/* DREQ GPIO input                                                         */
+/* ----------------------------------------------------------------------- */
+
+static void imxrt685_dma_dreq(void *opaque, int n, int level)
 {
-    if (level && (ch < DMA_CHANNEL_COUNT) &&
-        (s->chn[ch].cfg & DMA_CFG_HWTRIGEN)) {
-        dma_periph_request(s, ch);
+    Imxrt685DmaState *s = opaque;
+    unsigned chn = n;
+
+    if (chn >= DMA_CHANNEL_COUNT) {
+        return;
+    }
+
+    s->chn[chn].dreq_level = !!level;
+    trace_dma_dreq(chn, level);
+
+    /* If the channel is valid-pending and not already being serviced, schedule. */
+    if (s->chn[chn].valid_pending && !s->service_pending) {
+        s->service_pending = true;
+        dma_service_bh(s);
     }
 }
+
+/* ----------------------------------------------------------------------- */
+/* Reset                                                                   */
+/* ----------------------------------------------------------------------- */
 
 static void dma_reset(DeviceState *dev)
 {
@@ -244,13 +758,55 @@ static void dma_reset(DeviceState *dev)
 
     s->ctrl = 0;
     s->srambase = 0;
+    s->irq_state = false;
+    s->inta = 0;
+    s->intb = 0;
+    s->errint = 0;
+    s->inten = 0;
+
     for (i = 0; i < DMA_CHANNEL_COUNT; i++) {
-        s->chn[i].cfg = 0;
-        s->chn[i].xfercfg = 0;
-        timer_del(s->timer[i]);
+        Imxrt685DmaChn *c = &s->chn[i];
+
+        c->cfg = 0;
+        c->ctlstat = 0;
+        c->xfercfg = 0;
+        c->current_src = 0;
+        c->current_dst = 0;
+        c->next_desc = 0;
+        c->remaining = 0;
+
+        c->dreq_level = false;
+        c->valid_pending = false;
+        c->active = false;
+        c->busy = false;
     }
-    qemu_set_irq(s->irq, false);
+
+    s->service_pending = false;
+
+    imxrt685_dma_update_irq(s);
 }
+
+/* ----------------------------------------------------------------------- */
+/* Migration state                                                         */
+/* ----------------------------------------------------------------------- */
+
+static const VMStateDescription vmstate_dma_ch = {
+    .name = "imxrt685-dma-channel",
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(cfg, Imxrt685DmaChn),
+        VMSTATE_UINT32(ctlstat, Imxrt685DmaChn),
+        VMSTATE_UINT32(xfercfg, Imxrt685DmaChn),
+        VMSTATE_UINT32(current_src, Imxrt685DmaChn),
+        VMSTATE_UINT32(current_dst, Imxrt685DmaChn),
+        VMSTATE_UINT32(next_desc, Imxrt685DmaChn),
+        VMSTATE_UINT32(remaining, Imxrt685DmaChn),
+        VMSTATE_BOOL(dreq_level, Imxrt685DmaChn),
+        VMSTATE_BOOL(valid_pending, Imxrt685DmaChn),
+        VMSTATE_BOOL(active, Imxrt685DmaChn),
+        VMSTATE_BOOL(busy, Imxrt685DmaChn),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_imxrt685_dma = {
     .name = TYPE_IMXRT685_DMA,
@@ -258,25 +814,38 @@ static const VMStateDescription vmstate_imxrt685_dma = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, Imxrt685DmaState),
+        VMSTATE_UINT64(srambase, Imxrt685DmaState),
+        VMSTATE_BOOL(irq_state, Imxrt685DmaState),
+        VMSTATE_UINT32(inta, Imxrt685DmaState),
+        VMSTATE_UINT32(intb, Imxrt685DmaState),
+        VMSTATE_UINT32(errint, Imxrt685DmaState),
+        VMSTATE_UINT32(inten, Imxrt685DmaState),
+        VMSTATE_STRUCT_ARRAY(chn, Imxrt685DmaState, DMA_CHANNEL_COUNT, 0,
+                             vmstate_dma_ch, Imxrt685DmaChn),
         VMSTATE_END_OF_LIST()
-    }
+    },
 };
+
+/* ----------------------------------------------------------------------- */
+/* Init / Class                                                            */
+/* ----------------------------------------------------------------------- */
 
 static void dma_init(Object *obj)
 {
     Imxrt685DmaState *s = IMXRT685_DMA(obj);
-    unsigned i;
 
-    s->sample_rate = 48000;
-
-    for (i = 0; i < DMA_CHANNEL_COUNT; i++) {
-        s->timer[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL, NULL, NULL);
-    }
+    /* Service is triggered via deferred calls from DREQ/MMIO handlers. */
 
     memory_region_init_io(&s->mmio, OBJECT(s), &dma_ops, s,
-                          "imxrt685-dma", 0x1000);
+                          "imxrt685-dma", DMA_MMIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->mmio);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+
+    /* Create 33 DREQ GPIO inputs. */
+    for (unsigned i = 0; i < DMA_CHANNEL_COUNT; i++) {
+        qdev_init_gpio_in_named(DEVICE(s), imxrt685_dma_dreq,
+                                "dma-dreq", i);
+    }
 }
 
 static void dma_class_init(ObjectClass *klass, const void *data)

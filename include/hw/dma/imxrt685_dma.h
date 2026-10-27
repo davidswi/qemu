@@ -1,16 +1,34 @@
 /*
- * NXP MIMXRT685 DMA Controller (SDK-compatible lightweight model)
+ * NXP MIMXRT685 DMA0 Controller (SDK-compatible model)
  *
- * Models the subset of registers that the MCUXpresso SDK's fsl_dma.c /
- * fsl_i2s_dma.c driver accesses for I2S audio transfers.  This is NOT eDMA;
- * it is NXP's older peripheral DMA controller found at base address 0x40104000
- * (non-secure) / 0x50104000 (secure).
+ * Models the non-secure NXP peripheral DMA controller found at base
+ * address 0x40104000.  This is NOT eDMA; it is the older peripheral
+ * DMA used by fsl_dma.c / fsl_i2s_dma.c for I2S audio transfers.
  *
- * Register layout per channel n:
- *   CFG     at offset 0x400 + n*0x10 — PERIPHREQEN(0), HWTRIGEN(1)
- *   XFERCFG at offset 0x408 + n*0x10 — transfer count (bits 0:9), SWTRIG(12)
+ * Register layout (SDK-visible offsets):
+ *   CTRL          0x000 — global enable
+ *   INTSTAT       0x004 — active-interrupt summary
+ *   SRAMBASE      0x008 — descriptor-table base address
+ *   ENABLESET/CLR 0x020/0x028 — channel enable (W1S/W1C)
+ *   ACTIVE        0x030 — channels currently active
+ *   BUSY          0x038 — channels with in-flight transfers
+ *   ERRINT        0x040 — error interrupt flags (W1C)
+ *   INTENSET/CLR  0x048/0x050 — interrupt enable (W1S/W1C)
+ *   INTA          0x058 — transfer-complete A flags (W1C)
+ *   INTB          0x060 — transfer-complete B flags (W1C)
+ *   SETVALID      0x068 — set channel valid-pending (W1S)
+ *   SETTRIG       0x070 — set trigger latch (W1S)
+ *   ABORT         0x078 — abort channel (W1C)
  *
- * This is a local hardware-enablement device and must not be submitted upstream.
+ * Per-channel registers start at offset 0x400:
+ *   CFG           +0x0 — transfer configuration bits
+ *   CTLSTAT       +0x4 — control/status (TRIG, VALIDPENDING, etc.)
+ *   XFERCFG       +0x8 — channel-specific transfer config
+ *
+ * Channel n = 0..32; bank 1 for channel 32 uses the common register set.
+ *
+ * This is a local hardware-enablement device and must not be submitted
+ * upstream.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -18,44 +36,97 @@
 #ifndef HW_DMA_IMXRT685_DMA_H
 #define HW_DMA_IMXRT685_DMA_H
 
-#include "hw/core/irq.h"
+#include "hw/core/qdev.h"
 #include "hw/core/sysbus.h"
-#include "qemu/timer.h"
 
-/* Base addresses for the two DMA controllers. */
-#define IMXRT685_DMA0_BASE_NS   0x40104000ULL
-#define IMXRT685_DMA0_BASE      0x50104000ULL
-#define IMXRT685_DMA1_BASE_NS   0x40105000ULL
-#define IMXRT685_DMA1_BASE      0x50105000ULL
+/* Non-secure base address used by the SDK firmware. */
+#define IMXRT685_DMA0_BASE_NS  0x40104000ULL
 
 /* Channel count (from CMSIS header). */
-#define DMA_CHANNEL_COUNT       33
+#define DMA_CHANNEL_COUNT      33
 
-/* Per-channel state. */
-typedef struct Imxrt685DmaChn {
-    uint32_t cfg;          /* Channel configuration        */
-    uint32_t xfercfg;      /* Transfer configuration       */
-} Imxrt685DmaChn;
+/* CTRL bits. */
+#define DMA_CTRL_ENABLE        BIT(0)
+
+/* Per-channel CFG bits (compact storage). */
+#define DMA_CFG_PERIPHREQEN    BIT(0)   /* accept peripheral DREQ       */
+#define DMA_CFG_HWTRIGEN       BIT(1)   /* hardware trigger input active*/
+#define DMA_CFG_PRIORITY(n)      ((n) & 7)   /* priority field (bits 3:5 in real HW,
+                                                  stored compactly here; 0=high)*/
+#define DMA_CFG_NCOINCR        BIT(6)   /* source increment disable       */
+#define DMA_CFG_DOINCRRR       BIT(7)   /* destination increment disable  */
+
+/* Channel CTLSTAT bits. */
+#define DMA_CTLSTAT_TRIG       BIT(0)   /* trigger latch (set by SWTRIG/SETTRIG) */
+#define DMA_CTLSTAT_VALIDPENDING BIT(2) /* valid-pending flag               */
+#define DMA_CTLSTAT_BUSY       BIT(5)   /* channel is busy                  */
+
+/* XFERCFG control bit masks (bits 0:5). */
+#define DMA_XFER_CLRTRIG       BIT(0)   /* clear trigger on completion      */
+#define DMA_XFER_INTA          BIT(1)   /* interrupt A on complete          */
+#define DMA_XFER_INTB          BIT(2)   /* interrupt B on complete          */
+
+/* XFERCFG field positions. */
+#define DMA_XFER_WIDTH(n)        extract32((n), 8, 2)   /* width 9:8    */
+#define DMA_XFER_SRCINC(n)       extract32((n), 12, 4)  /* src inc 15:12*/
+#define DMA_XFER_DSTINC(n)       extract32((n), 16, 4)  /* dst inc 19:16*/
+#define DMA_XFER_COUNT(n)        ((n) >> 10)            /* count 25:10  */
+
+/* Width multiplier. */
+static inline unsigned dma_width_bytes(unsigned width)
+{
+    return 1U << width;
+}
 
 #define TYPE_IMXRT685_DMA "imxrt685-dma"
 OBJECT_DECLARE_SIMPLE_TYPE(Imxrt685DmaState, IMXRT685_DMA)
 
+/* Descriptor layout in SRAM (little-endian words). */
+typedef struct {
+    uint32_t xfercfg;   /* word 0: transfer configuration         */
+    uint32_t src_end;   /* word 1: source end address             */
+    uint32_t dst_end;   /* word 2: destination end address        */
+    uint32_t link;      /* word 3: link to next descriptor (0=end)*/
+} DMADescriptor;
+
+/* Per-channel state structure. */
+typedef struct Imxrt685DmaChn {
+    uint32_t cfg;
+    uint32_t ctlstat;
+    uint32_t xfercfg;
+    uint32_t current_src;
+    uint32_t current_dst;
+    uint32_t next_desc;
+    unsigned remaining;
+
+    bool dreq_level;
+    bool valid_pending;
+    bool active;
+    bool busy;
+} Imxrt685DmaChn;
+
 struct Imxrt685DmaState {
     SysBusDevice parent_obj;
 
-    MemoryRegion mmio;     /* DMA register space             */
-    qemu_irq irq;          /* Completion interrupt to NVIC   */
-    QEMUTimer *timer[DMA_CHANNEL_COUNT];  /* Per-channel timer for cadence */
+    MemoryRegion mmio;         /* DMA register space             */
+    qemu_irq irq;              /* shared IRQ to NVIC             */
 
-    uint32_t ctrl;         /* CTRL register (enable bit)     */
-    hwaddr srambase;       /* SRAMBASE (descriptor table addr) */
+    /* Controller state. */
+    uint32_t ctrl;             /* CTRL — global enable           */
+    hwaddr srambase;           /* SRAMBASE — descriptor table    */
+    bool irq_state;            /* current IRQ level (cached)     */
 
-    Imxrt685DmaChn chn[DMA_CHANNEL_COUNT];  /* Per-channel state */
+    /* Channel state. */
+    Imxrt685DmaChn chn[DMA_CHANNEL_COUNT];
 
-    uint32_t sample_rate;  /* Audio cadence for DREQ timing  */
+    /* Interrupt state. */
+    uint32_t inta;
+    uint32_t intb;
+    uint32_t errint;
+    uint32_t inten;
+
+    /* Deferred DMA service flag (re-entrancy guard). */
+    bool service_pending;
 };
-
-/* DREQ callback: called when a Flexcomm I2S peripheral requests DMA transfer. */
-void imxrt685_dma_handle_dreq(Imxrt685DmaState *s, unsigned ch, int level);
 
 #endif /* HW_DMA_IMXRT685_DMA_H */

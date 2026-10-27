@@ -36,14 +36,14 @@ pl330_dmakill(void) "abort interrupt lowered"
 pl330_dmalpend(uint8_t nf, uint8_t bs, uint8_t lc, uint8_t ch, uint8_t flag) "nf=0x%02x bs=0x%02x lc=0x%02x ch=0x%02x flag=0x%02x"
 pl330_dmalpiter(void) "loop reiteration"
 pl330_dmalpfallthrough(void) "loop fallthrough"
-pl330_dmasev_evirq(uint8_t ev_id) "event interrupt raised %"PRId8
-pl330_dmasev_event(uint8_t ev_id) "event raised %"PRId8
 pl330_dmast(uint8_t chan, uint32_t addr, uint32_t sz, uint32_t num, char ch) "channel:%"PRId8" address:0x%08"PRIx32" size:0x%"PRIx32" num:%"PRId32" %c"
 pl330_dmawfe(uint8_t ev_id) "event lowered 0x%"PRIx8
 pl330_chan_exec_undef(void) "undefined instruction"
 pl330_iomem_write(uint32_t offset, uint32_t value) "addr: 0x%08"PRIx32" data: 0x%08"PRIx32
 pl330_iomem_write_clr(int i) "event interrupt lowered %d"
 pl330_iomem_read(uint32_t addr, uint32_t data) "addr: 0x%08"PRIx32" data: 0x%08"PRIx32
+pl330_dmasev_evirq(uint8_t ev_id) "event interrupt raised %"PRId8
+pl330_dmasev_event(uint8_t ev_id) "event raised %"PRId8
 
 # xilinx_axidma.c
 xilinx_axidma_loading_desc_fail(uint32_t res) "error:%u"
@@ -53,18 +53,65 @@ k230_gsdma_read(uint64_t addr, unsigned int size, uint64_t data) "K230 GSDMA rea
 k230_gsdma_write(uint64_t addr, unsigned int size, uint64_t data) "K230 GSDMA write: [0x%"PRIx64"] size %u <- 0x%"PRIx64
 
 # imxrt685_dma.c — NXP DMA0 controller for I2S audio
-dma_ctrl_enable(void)                             "DMA CTRL: enable set"
-dma_ctrl_disable(void)                            "DMA CTRL: enable cleared"
-dma_srambase(uint64_t base)                       "SRAMBASE <- 0x%016" PRIx64
-dma_read(unsigned ch, unsigned offset, uint64_t addr, uint32_t val) "ch%u read[0x%03x] [0x%" PRIx64 "] -> 0x%08x"
-dma_write(unsigned ch, unsigned offset, uint64_t addr, uint32_t val) "ch%u write[0x%03x] [0x%" PRIx64 "] <- 0x%08x"
-dma_read_unimplemented(uint64_t offset)           "unimplemented read at 0x%03" PRIx64
-dma_write_unimplemented(uint64_t offset, uint64_t value) "unimplemented write at 0x%03" PRIx64 " val=0x%" PRIx64
-dma_write_chn_oob(unsigned ch)                    "channel %u out of bounds"
-dma_sw_trigger(unsigned ch)                       "ch%u software trigger"
-dma_periph_request(unsigned ch, uint32_t xfercfg) "ch%u peripheral request xfercfg=0x%08x"
-dma_transfer_active(unsigned ch, uint32_t count)  "ch%u transfer active count=%u"
-imxrt685_dma_ch_complete(unsigned ch)                         "ch%u transfer complete — IRQ asserted"
-imxrt685_dma_ch_done(unsigned ch)                             "ch%u DMA done (count=0)"
-dma_chn_cfg(unsigned ch, uint32_t cfg)            "ch%u CFG <- 0x%08x"
-dma_chn_xfercfg(unsigned ch, uint32_t xfercfg)    "ch%u XFERCFG <- 0x%08x"
+# IRQ
+dma_irq_transition(const char *action, uint32_t normal_pending, uint32_t error_pending) "%s: normal=0x%08x error=0x%08x"
+
+# Register access
+dma_read(uint32_t offset, uint32_t val) "read reg[0x%03x] -> 0x%08x"
+dma_write(uint32_t offset, uint64_t value) "write reg[0x%03x] <- 0x%" PRIx64
+dma_read_chn(unsigned chn, unsigned offset, uint32_t val) "ch%u read[0x%02x] -> 0x%08x"
+dma_write_chn_oob(unsigned chn) "ch%u write out of bounds"
+dma_read_chn_oob(uint32_t offset) "read channel register OOB at 0x%03x"
+
+# CTRL / SRAMBASE
+dma_ctrl_enable(void)                               "DMA CTRL: enable set"
+dma_ctrl_disable(void)                              "DMA CTRL: enable cleared"
+dma_srambase(uint64_t base)                         "SRAMBASE <- 0x%016" PRIx64
+
+# Channel enable/clear
+dma_enable_set(unsigned chn)                        "ch%u ENABLESET set"
+dma_enable_clear(unsigned chn)                      "ch%u ENABLECLR clear"
+
+# Descriptor loading/fetching
+dma_descriptor_loaded(uint64_t addr, uint32_t xfercfg, uint32_t src_end, uint32_t dst_end, uint32_t link) "descriptor@0x%" PRIx64 ": cfg=0x%08x src_end=0x%08x dst_end=0x%08x link=0x%08x"
+dma_descriptor_fetch_error(uint64_t addr)           "descriptor fetch ERROR at 0x%" PRIx64
+dma_descriptor_link_misaligned(uint32_t link)       "link misaligned: 0x%08x"
+dma_channel_loaded(unsigned chn, uint32_t xfercfg, uint32_t src, uint32_t dst, unsigned remaining)    "ch%u loaded: cfg=0x%08x src=0x%08x dst=0x%08x remain=%u"
+
+# Transfer beats
+dma_beat(unsigned chn, uint32_t xfercfg, uint32_t data, uint32_t old_src, uint32_t old_dst) "ch%u beat: cfg=0x%08x data=0x%08x src 0x%08x-> dst 0x%08x"
+
+# Descriptor completion
+dma_descriptor_complete(unsigned chn, uint32_t inta, uint32_t intb) "ch%u complete: INTA=0x%08x INTB=0x%08x"
+dma_descriptor_reload(unsigned chn, uint32_t link_addr)       "ch%u reload from 0x%08x"
+dma_channel_stopped(unsigned chn)                   "ch%u stopped (descriptor exhausted)"
+
+# Errors
+dma_error_invalid_width(unsigned chn, unsigned width) "ch%u invalid width %u"
+dma_error_bus_fault(unsigned chn, const char *dir, uint32_t addr)   "ch%u bus fault %s 0x%08x"
+dma_error_descriptor_fetch(unsigned chn)            "ch%u descriptor fetch failed"
+
+# Interrupt register operations
+dma_errint_clear(uint32_t mask)                     "ERRINT clear mask=0x%08x"
+dma_inten_set(uint32_t mask)                        "INTEN set 0x%08x"
+dma_inten_clear(uint32_t mask)                      "INTEN clear 0x%08x"
+dma_inta_clear(uint32_t mask)                       "INTA clear   0x%08x"
+dma_intb_clear(uint32_t mask)                       "INTB clear   0x%08x"
+
+# Control operations
+dma_setvalid(unsigned chn)                          "ch%u SETVALID set"
+dma_settrig(unsigned chn)                           "ch%u SETTRIG set"
+dma_abort(unsigned chn)                             "ch%u ABORT"
+dma_swtrig(unsigned chn)                            "ch%u SWTRIG (CLRTRIG)"
+dma_ctlstat_clrtrig(unsigned chn)                   "ch%u CTLSTAT CLRTRIG"
+dma_chn_cfg(unsigned chn, uint32_t cfg)             "ch%u CFG <- 0x%08x"
+dma_chn_xfercfg(unsigned chn, uint32_t xfercfg)     "ch%u XFERCFG <- 0x%08x"
+dma_chn_ctlstat(unsigned chn, uint32_t ctlstat)     "ch%u CTLSTAT <- 0x%08x"
+
+# DREQ
+dma_dreq(unsigned chn, int level)                   "ch%u DREQ = %d"
+
+# Unimplemented access
+dma_read_unimplemented(uint32_t offset)             "unimplemented read at 0x%03x"
+dma_write_unimplemented(uint32_t offset, uint64_t value)       "unimplemented write at 0x%03x val=0x%" PRIx64
+dma_chn_write_unimplemented(unsigned chn, unsigned offset, uint64_t value)   "ch%u unimpl write[0x%02x] = 0x%" PRIx64

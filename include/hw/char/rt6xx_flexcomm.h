@@ -1,6 +1,10 @@
 /*
  * NXP i.MX RT6xx Flexcomm
  *
+ * DMA DREQ GPIO output names:
+ *   "dma-dreq-tx" — asserted when TX FIFO is at/below watermark
+ *   "dma-dreq-rx" — asserted when RX FIFO is above watermark
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -113,6 +117,10 @@ typedef struct Rt6xxFlexcommSpiState {
  * personality, so selection changes never alias data between the two
  * directions.  The audio link pops the TX FIFO and pushes the RX FIFO
  * once per board audio frame.
+ *
+ * DMA DREQ outputs:
+ *   - TX: asserted when I2S+DMATX+TXLVLENA enabled and tx_count <= TXLVL
+ *   - RX: asserted when I2S+DMARX+RXLVLENA enabled and rx_count > RXLVL
  */
 typedef struct Rt6xxFlexcommI2sState {
     uint32_t cfg1;
@@ -130,10 +138,9 @@ typedef struct Rt6xxFlexcommI2sState {
     uint8_t rx_head;
     uint8_t rx_count;
 
-    /* DMA integration: DREQ callback to eDMA controller. */
-    void *dreq_opaque;      /* opaque pointer for the callback    */
-    void (*dreq_assert)(void *opaque, int level);  /* DREQ signal        */
-    bool dreq_asserted;     /* cached DREQ assertion state         */
+    /* DMA DREQ output levels (GPIO). */
+    qemu_irq dreq_tx;       /* TX watermark DREQ               */
+    qemu_irq dreq_rx;       /* RX watermark DREQ               */
 } Rt6xxFlexcommI2sState;
 
 typedef struct Rt6xxFlexcommUsartState {

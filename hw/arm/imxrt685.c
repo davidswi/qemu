@@ -51,15 +51,7 @@ static_assert(ARRAY_SIZE(flexcomm_desc) ==
 
 
 
-/* DREQ callback: Flexcomm I2S TX watermark triggers DMA channel 7 transfer. */
-static void imxrt685_dma_dreq_cb(void *opaque, int level)
-{
-    Imxrt685DmaState *dma = opaque;
 
-    /* Channel 7 is used for Flexcomm3 I2S TX by the SDK. */
-    imxrt685_dma_handle_dreq(dma, 7, level);
-}
-static void imxrt685_dreq_rx(void *opaque, int level);
 
 static void imxrt685_init(Object *obj)
 {
@@ -258,25 +250,33 @@ static void imxrt685_realize(DeviceState *dev, Error **errp)
                                     DEVICE(&s->ostimer), "reset", 0));
 
     /*
-     * NXP DMA0 controller for I2S audio DMA transfers.
-     * SDK uses channel 7 for Flexcomm3 (I2S TX) hardware-triggered transfers.
+     * NXP DMA0 controller for I2S audio descriptor-based transfers.
+     *
+     * SDK uses:
+     *   - Channel 7: Flexcomm3 (I2S TX) — SRAM→FIFOWR
+     *   - Channel 2: Flexcomm1 (I2S RX) — FIFORD→SRAM
      */
     {
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma), errp)) {
             return;
         }
-        sysbus_mmio_map(SYS_BUS_DEVICE(&s->dma), 0, IMXRT685_DMA0_BASE);
-        /* Wire DMA completion interrupt to NVIC (IRQ 1 = DMA0 in secure mode).
-         * The SDK's non-secure I2S example uses DMA0_NS which shares the IRQ. */
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->dma), 0,
+                        IMXRT685_DMA0_BASE_NS);
+        /* Wire DMA completion interrupt to NVIC (IRQ 1 = DMA0). */
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->dma), 0,
                            qdev_get_gpio_in(armv7m, 1));
 
-        /*
-         * Wire DREQ: when Flexcomm3 I2S TX FIFO watermark triggers, call back
-         * into DMA controller to execute a transfer on channel 7.
-         */
-        s->flexcomm[3].i2s.dreq_opaque = &s->dma;
-        s->flexcomm[3].i2s.dreq_assert = imxrt685_dma_dreq_cb;
+        /* Flexcomm1 RX DREQ → DMA channel 2. */
+        qdev_connect_gpio_out_named(DEVICE(&s->flexcomm[1]), "dma-dreq-rx",
+                                    0,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&s->dma), "dma-dreq", 2));
+
+        /* Flexcomm3 TX DREQ → DMA channel 7. */
+        qdev_connect_gpio_out_named(DEVICE(&s->flexcomm[3]), "dma-dreq-tx",
+                                    0,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&s->dma), "dma-dreq", 7));
     }
 
     /*

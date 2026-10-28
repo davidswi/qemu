@@ -71,7 +71,7 @@ if have_system
   util_ss.add(files('crc-ccitt.c'))
   util_ss.add(when: gio, if_true: files('dbus.c'))
   if host_os == 'linux'
-    util_ss.add(files('userfaultfd.c'))
+    util_ss.add(files('userfaultfd.c', 'qemu-io-bridge.c'))
   endif
 endif
 

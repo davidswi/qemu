@@ -91,6 +91,8 @@ typedef struct xtensa_operand_internal_struct {
     xtensa_immed_decode_fn decode;      /* Decode the value from the field. */
     xtensa_do_reloc_fn do_reloc;        /* Perform a PC-relative reloc. */
     xtensa_undo_reloc_fn undo_reloc;    /* Undo a PC-relative relocation. */
+    int reg_min;                        /* Lowest register operand value. */
+    int reg_max;                        /* Highest register operand value. */
 } xtensa_operand_internal;
 
 typedef struct xtensa_arg_internal_struct {

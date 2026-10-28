@@ -19,3 +19,13 @@ config XTENSA_XTFPGA
     select OPENCORES_ETH
     select PFLASH_CFI01
     select SERIAL_MM
+
+config MIMXRT685_HIFI4
+    bool
+    default y
+    depends on XTENSA
+    select XTENSA_SIM
+    select RT6XX_FLEXCOMM
+    select RT6XX_GPIO
+    select RT6XX_RSTCTL
+    select RT6XX_SYSCON

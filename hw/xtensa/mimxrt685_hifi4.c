@@ -26,6 +26,10 @@
 #include "xtensa_memory.h"
 #include "xtensa_sim.h"
 
+#include "qemu/io-bridge.h"
+#include "qemu/log-for-trace.h"
+#include "qemu/log.h"
+
 #define TYPE_MIMXRT685_HIFI4_MACHINE \
     MACHINE_TYPE_NAME("mimxrt685-evk-hifi4")
 OBJECT_DECLARE_SIMPLE_TYPE(MIMXRT685HiFi4MachineState,
@@ -54,6 +58,41 @@ struct MIMXRT685HiFi4MachineState {
 static void mimxrt685_hifi4_cpu_reset(void *opaque)
 {
     cpu_reset(CPU(opaque));
+}
+
+static int mimxrt685_bridge_cb(void *opaque, struct qemu_io_msg *msg)
+{
+    // MIMXRT685HiFi4MachineState *s = opaque;
+
+    qemu_log_mask(LOG_TRACE, "Bridge callback msg[%d] for child core", msg->type);
+
+    switch (msg->type) {
+        case QEMU_IO_TYPE_IRQ:
+            break;
+
+        case QEMU_IO_TYPE_DMA:
+            break;
+
+        case QEMU_IO_TYPE_MEM:
+            break;
+
+        case QEMU_IO_TYPE_REG:
+            break;
+
+        case QEMU_IO_TYPE_PM:
+            break;
+
+        case QEMU_IO_TYPE_QEMU:
+            break;
+
+        case QEMU_IO_TYPE_GDB:
+            break;
+
+        default:
+            break;
+    }
+
+    return 0;
 }
 
 static void mimxrt685_hifi4_init(MachineState *machine)
@@ -114,6 +153,9 @@ static void mimxrt685_hifi4_init(MachineState *machine)
                                 qdev_get_gpio_in_named(fc, "clock-enabled", 0));
     qdev_connect_gpio_out_named(DEVICE(&s->rstctl1), "flexcomm-reset", 0,
                                 qdev_get_gpio_in_named(fc, "reset", 0));
+
+
+    qemu_io_register_child("mu-bridge", mimxrt685_bridge_cb, (void *)s);
 
     if (!machine->kernel_filename) {
         error_report("mimxrt685-evk-hifi4 requires an Xtensa ELF "

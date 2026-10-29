@@ -9,6 +9,9 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/audio.h"
+
+#include "qemu/io-bridge.h"
+
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "hw/arm/imxrt685.h"
@@ -17,6 +20,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/imxrt685_dma.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
 
 /*
  * The RT685S integrates ten Flexcomm blocks.  Entries are in SDK
@@ -49,9 +53,41 @@ static_assert(ARRAY_SIZE(flexcomm_desc) ==
               "Flexcomm descriptor table and SoC state must match");
 
 
+static int imxrt685_bridge_cb(void *opaque,
+                             struct qemu_io_msg *msg)
+{
+    IMXRT685State *s = opaque;
 
+    qemu_log_mask(LOG_TRACE, "Bridge callback msg[%d] for parent core: %s", msg->type, s->cpu_type);
 
+    switch (msg->type) {
+        case QEMU_IO_TYPE_IRQ:
+            break;
 
+        case QEMU_IO_TYPE_DMA:
+            break;
+
+        case QEMU_IO_TYPE_MEM:
+            break;
+
+        case QEMU_IO_TYPE_REG:
+            break;
+
+        case QEMU_IO_TYPE_PM:
+            break;
+
+        case QEMU_IO_TYPE_QEMU:
+            break;
+
+        case QEMU_IO_TYPE_GDB:
+            break;
+
+        default:
+            break;
+    }
+
+    return 0;
+}
 
 static void imxrt685_init(Object *obj)
 {
@@ -84,6 +120,8 @@ static void imxrt685_init(Object *obj)
     object_initialize_child(obj, "audio-link", &s->audio_link,
                             TYPE_RT685_AUDIO_LINK);
     object_initialize_child(obj, "dma", &s->dma, TYPE_IMXRT685_DMA);
+
+    qemu_io_register_parent("mu-bridge", imxrt685_bridge_cb, (void *)s);
 }
 
 static bool imxrt685_realize_syscon(Rt6xxSysconState *s, unsigned variant,

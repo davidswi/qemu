@@ -70292,10 +70292,11 @@ static int ATTRIBUTE_UNUSED num_bypass_groups(void) {
 static int ATTRIBUTE_UNUSED num_bypass_group_chunks(void) {
     return 0;
 }
-
+/*
 static uint32 *ATTRIBUTE_UNUSED bypass_entry(int i ATTRIBUTE_UNUSED) {
     return 0;
 }
+*/
 
 
 /* Opcode table.  */
